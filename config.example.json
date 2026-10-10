@@ -1,0 +1,27 @@
+{
+  "_comment": "示例配置 — 复制为 config.json 后填入你的真实凭证。config.json 已在 .gitignore 中，永远不会进 git。",
+
+  "volcengine": {
+    "app_id": "<YOUR_VOLCENGINE_APP_ID>",
+    "access_token": "<YOUR_VOLCENGINE_ACCESS_TOKEN>",
+    "resource_id": "volc.service_type.10050",
+    "app_key": "<YOUR_VOLCENGINE_APP_KEY>",
+    "wss_url": "wss://openspeech.bytedance.com/api/v3/sami/podcasttts"
+  },
+  "minimax": {
+    "api_key": "<YOUR_MINIMAX_API_KEY>",
+    "api_base": "https://api.minimaxi.com"
+  },
+  "audio": {
+    "sample_rate": 24000,
+    "format": "mp3",
+    "bitrate": 128000
+  },
+  "output": {
+    "dir": "output"
+  },
+  "post_processing": {
+    "normalize_audio": true,
+    "cleanup_temp_files": true
+  }
+}

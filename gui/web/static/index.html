@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Podcast Generator — Web 看板</title>
+  <link rel="stylesheet" href="/static/css/theme.css">
+</head>
+<body>
+  <div class="app-root">
+    <!-- 头部 -->
+    <header class="app-header">
+      <div>
+        <h1>🎙️ Podcast Generator</h1>
+        <span class="version" id="version-tag">加载中…</span>
+      </div>
+      <div>
+        <span id="ws-status" class="disconnected"></span>
+        <span id="status-text" class="status-ok">✅ 准备就绪</span>
+      </div>
+    </header>
+
+    <!-- 两栏主体 -->
+    <main class="app-body">
+      <!-- ========== 左栏：输入 ========== -->
+      <section class="column column-left">
+        <div class="column-header">
+          <span>📥 输入 / Input</span>
+          <span style="font-size:11px; color:var(--color-text-light);">引擎、凭证、音色、脚本</span>
+        </div>
+        <div class="column-body">
+
+          <!-- 引擎选择 -->
+          <div class="section">
+            <div class="section-title">🔧 引擎</div>
+            <div class="form-row">
+              <label class="form-label">TTS 引擎</label>
+              <select id="engine-select" class="form-select">
+                <option value="voxcpm">VoxCPM2 (本地 / Apple Silicon)</option>
+                <option value="minimax">MiniMax (云端)</option>
+                <option value="doubao">豆包 / 火山 (云端)</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- 凭证 -->
+          <div class="section">
+            <div class="section-title">🔑 凭证</div>
+            <div class="form-row">
+              <label class="form-label">API Key</label>
+              <input type="password" class="form-input" id="cred-api-key"
+                     placeholder="MiniMax 引擎需要">
+            </div>
+            <div class="form-row">
+              <label class="form-label">App ID</label>
+              <input type="text" class="form-input" id="cred-app-id"
+                     placeholder="豆包引擎需要">
+            </div>
+            <div class="form-row">
+              <label class="form-label">Token</label>
+              <input type="password" class="form-input" id="cred-token"
+                     placeholder="豆包引擎需要">
+            </div>
+            <p style="font-size:11px; color:var(--color-text-light); margin-top:4px;"
+               id="cred-hint">
+              VoxCPM 引擎不需要凭证（本地推理）
+            </p>
+            <p id="cred-status" style="font-size:11px; margin-top:2px;"></p>
+          </div>
+
+          <!-- 音色列表（动态） -->
+          <div class="section">
+            <div class="section-title">🎭 音色（可加可删，2 行起）</div>
+            <div id="voice-rows">
+              <!-- JS 动态插入 -->
+            </div>
+            <button class="btn btn-secondary" id="add-voice-btn" style="margin-top:8px;">
+              ➕ 添加音色
+            </button>
+            <button class="btn btn-ghost" id="reload-voices-btn" style="margin-top:8px; margin-left:4px;">
+              🔄 刷新音色库
+            </button>
+            <p style="font-size:11px; color:var(--color-text-light); margin-top:6px;">
+              前 2 行固定为"主播甲"和"主播乙"，不可删除。<br>
+              选好的 voice_id 会按 marker 自动分配（甲→第 1 行，乙→第 2 行…）
+            </p>
+          </div>
+
+          <!-- 音色库预览 -->
+          <div class="section">
+            <div class="section-title">📚 音色库（<span id="voice-count">0</span> 个）</div>
+            <div id="voice-library-list" style="font-size:12px; max-height:240px; overflow-y:auto;">
+              <div class="placeholder"><div>加载中…</div></div>
+            </div>
+            <button class="btn btn-secondary" id="upload-voice-btn" style="margin-top:8px;">
+              ➕ 上传新音色
+            </button>
+            <button class="btn btn-ghost" id="record-voice-btn" style="margin-top:8px; margin-left:4px;">
+              🎤 录制新音色
+            </button>
+            <input type="file" id="voice-file-input" accept=".wav,audio/wav"
+                   style="display:none;">
+            <div id="record-panel" style="display:none; margin-top:8px; padding:8px;
+                                          background:var(--color-cream); border-radius:6px;">
+              <div style="font-size:12px; margin-bottom:6px;">点击 🎤 开始录音，再点一次停止</div>
+              <button class="btn btn-primary" id="record-toggle-btn">🎤 开始</button>
+              <span id="record-status" style="margin-left:8px; font-size:12px; color:var(--color-text-light);">未录音</span>
+              <div id="record-result" style="margin-top:8px;"></div>
+            </div>
+          </div>
+
+          <!-- 脚本编辑器 -->
+          <div class="section">
+            <div class="section-title">📜 脚本</div>
+            <div class="form-row">
+              <label class="form-label">来源</label>
+              <select id="script-source" class="form-select">
+                <option value="paste">直接粘贴</option>
+                <option value="import">导入历史</option>
+                <option value="ai">AI 生成 (MiniMax M3)</option>
+              </select>
+            </div>
+
+            <!-- 直接粘贴：默认就显示 textarea -->
+            <div id="source-paste" class="source-panel">
+              <textarea id="script-editor" class="form-textarea" rows="8"
+                        placeholder="在这里编辑或粘贴台词…
+
+格式示例：
+---
+
+【主播甲】
+大家好，欢迎收听。
+
+---
+
+【主播乙】
+今天聊脾脏硬度。"></textarea>
+              <button class="btn btn-ghost" id="save-script-btn"
+                      style="margin-top:6px; font-size:12px; padding:4px 10px;">
+                💾 保存到历史
+              </button>
+            </div>
+
+            <!-- 导入历史：下拉选一个 -->
+            <div id="source-import" class="source-panel" style="display:none;">
+              <p style="font-size:12px; color:var(--color-text-light); margin-bottom:6px;">
+                选一个历史脚本，会自动填到上方编辑器
+              </p>
+              <select id="recent-scripts-select" class="form-select">
+                <option>加载中…</option>
+              </select>
+              <button class="btn btn-secondary" id="load-recent-btn"
+                      style="margin-top:6px;">
+                📥 加载到编辑器
+              </button>
+              <button class="btn btn-ghost" id="refresh-recent-btn"
+                      style="margin-top:6px; margin-left:4px; font-size:12px;">
+                🔄 刷新列表
+              </button>
+            </div>
+
+            <!-- AI 生成：填表 -->
+            <div id="source-ai" class="source-panel" style="display:none;">
+              <div class="form-row">
+                <label class="form-label">主题 *</label>
+                <input type="text" class="form-input" id="ai-topic"
+                       placeholder="如：高血压患者能不能吃鸡蛋">
+              </div>
+              <div class="form-row">
+                <label class="form-label">原始素材</label>
+                <textarea id="ai-context" class="form-textarea" rows="3"
+                          placeholder="可空。粘贴文章 / 论文 / 笔记，LLM 会基于此改写"></textarea>
+              </div>
+              <div class="form-row">
+                <label class="form-label">附加要求</label>
+                <input type="text" class="form-input" id="ai-custom"
+                       placeholder="可空。如「风格再幽默一点」「加入一个病人提问环节」">
+              </div>
+              <div class="form-row">
+                <label class="form-label">主持人</label>
+                <select id="ai-n-speakers" class="form-select">
+                  <option value="2">2 主持人（甲+乙）</option>
+                  <option value="3">3 主持人（甲+乙+护士）</option>
+                </select>
+              </div>
+              <button class="btn btn-primary" id="ai-generate-btn"
+                      style="margin-top:6px;">
+                🤖 生成脚本
+              </button>
+              <p style="font-size:11px; color:var(--color-text-light); margin-top:6px;"
+                 id="ai-hint">
+                需 MiniMax API key（应已从 config.json 加载）
+              </p>
+            </div>
+
+            <p style="font-size:11px; color:var(--color-text-light); margin-top:4px;">
+              格式：<code>---</code> 一行 + <code>【主播甲】</code> 全角一行 + 正文
+            </p>
+          </div>
+
+          <!-- intro / outro -->
+          <div class="section">
+            <div class="section-title">🎬 引言 / 结语</div>
+            <div class="form-row">
+              <label class="form-label">引言</label>
+              <input type="text" class="form-input" id="intro-text"
+                     placeholder="可选；如「欢迎收听科普播客」" disabled>
+            </div>
+            <div class="form-row">
+              <label class="form-label">结语</label>
+              <input type="text" class="form-input" id="outro-text"
+                     placeholder="可选；如「下期再见」" disabled>
+            </div>
+            <p style="font-size:11px; color:var(--color-text-light);">
+              留空则不添加
+            </p>
+          </div>
+
+          <!-- 生成按钮 -->
+          <div class="section" style="text-align:center;">
+            <button class="btn btn-primary" id="generate-btn"
+                    style="font-size:14px; padding:10px 24px;">
+              🎵 生成音频
+            </button>
+            <p style="font-size:11px; color:var(--color-text-light); margin-top:6px;">
+              VoxCPM 引擎已接通（Phase 3）<br>
+              选好 voice + 脚本非空 + 解析成功 = 可点击
+            </p>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ========== 右栏：输出 ========== -->
+      <section class="column column-right">
+        <div class="column-header">
+          <span>📤 输出 / Output</span>
+          <span style="font-size:11px; color:var(--color-text-light);">进度、日志、播放</span>
+        </div>
+        <div class="column-body">
+
+          <!-- 进度 -->
+          <div class="section">
+            <div class="section-title">📊 进度</div>
+            <div class="progress">
+              <div class="progress-bar" id="progress-bar" style="width:0%">0%</div>
+            </div>
+            <p id="progress-text" style="font-size:12px; margin-top:6px; color:var(--color-text-light);">
+              等待开始…
+            </p>
+          </div>
+
+          <!-- 解析预览 -->
+          <div class="section">
+            <div class="section-title">🔍 脚本解析</div>
+            <div id="parse-preview" class="placeholder">
+              <div>把脚本贴进左侧编辑器，会在这里显示解析出的段数</div>
+            </div>
+            <button class="btn btn-secondary" id="parse-btn"
+                    style="margin-top:8px; font-size:12px;">
+              🔍 重新解析
+            </button>
+          </div>
+
+          <!-- 日志 -->
+          <div class="section">
+            <div class="section-title">📋 实时日志</div>
+            <div id="log-box" class="log-box">
+              <p class="log-line log-info">[系统] Web 看板已启动。等待 Phase 2 接通 parse 路由…</p>
+            </div>
+            <p style="font-size:11px; color:var(--color-text-light); margin-top:4px;">
+              Phase 3 起通过 WebSocket 推送
+            </p>
+          </div>
+
+          <!-- 音频播放 -->
+          <div class="section">
+            <div class="section-title">🔊 输出音频</div>
+            <div id="audio-player-area" class="placeholder">
+              <div>生成的 mp3 会在这里显示播放器（最近 5 个）</div>
+            </div>
+            <button class="btn btn-ghost" id="clear-audio-btn"
+                    style="margin-top:6px; font-size:11px; display:none;">
+              🗑 清空
+            </button>
+          </div>
+
+        </div>
+      </section>
+    </main>
+
+    <!-- 底部状态栏 -->
+    <footer class="app-footer">
+      <span>Phase 7 — 打磨 / 响应式 / 音频历史 / 速度滑块</span>
+      <span id="footer-status">FastAPI 后端运行中</span>
+    </footer>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

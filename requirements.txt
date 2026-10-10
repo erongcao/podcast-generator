@@ -1,0 +1,11 @@
+# Existing runtime deps
+customtkinter
+requests
+urllib3
+
+# New for voice cloning feature
+sounddevice
+soundfile
+
+# Test deps
+pytest

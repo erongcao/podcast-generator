@@ -1,0 +1,29 @@
+# Ruff 配置：拦截 builtin shadowing 等低级命名错误
+# 规则类别：
+#   A    - flake8-builtins: 检测覆盖 Python builtin 的命名（A001 函数/A002 方法/A003 类/A004 变量）
+#   E/W  - pycodestyle 风格（E 错误 / W 警告）
+#   F    - pyflakes 未使用变量、导入等
+#   B    - flake8-bugbear 常见 bug 模式
+# 跑法: ruff check .  或  ruff check voice_library.py
+
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = [
+    "A",    # builtin shadowing —— 本项目历史 bug 的根源
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "B",    # bugbear
+    "I",    # isort 导入排序
+    "UP",   # pyupgrade 现代语法
+]
+
+# 这几个 builtin 命名是历史代码遗留（已修复），加 per-file-ignores 避免误伤
+[lint.per-file-ignores]
+# voice_library.py 历史上有 list()，已改为 list_all()，但保留兼容性 alias
+# 不在这里 ignore —— 真有问题就该显式处理
+
+# 测试文件允许未使用 import（fixture 等）
+"tests/*" = ["F401", "F811"]
