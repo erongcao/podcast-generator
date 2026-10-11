@@ -375,7 +375,7 @@ window.addEventListener('beforeunload', (e) => {
 | 文本 > 50KB | parse debounce 改 1000ms（避免大脚本卡） |
 | ~~Safari Cmd+H~~ | **Review 反馈 #5 已删除**，不拦截 |
 | 预览时按保存 | 不允许 —— 切回 edit 模式才能保存 |
-| **主页 AI 生成（script_done via WS）** | **Review 反馈 #6 + MAJOR-6**：/editor 订阅 WebSocket，收到 `script_done` → toast "主页 AI 生成了新脚本「<topic>」，点击加载？"。**点击时若 dirty=true 先 confirm()** "当前编辑未保存，确定加载新脚本？" 再触发 `?load=` 跳转（避免静默覆盖） |
+| **主页 AI 生成（script_done via WS）** | **Review 反馈 #6 + MAJOR-6 + F1**：/editor 订阅 WebSocket，收到 `script_done` → toast "主页 AI 生成了新脚本「<topic>」，点击加载？"。**点击时若 dirty=true 先 confirm()** "当前编辑未保存，确定加载新脚本？" → 用户确认后 `state.dirty = false`（避免 beforeunload 二次弹窗） → `location.href = '/editor?load=' + name` |
 | **WS 断线** | **Review 反馈 MAJOR-3**：onclose 重连，线性 backoff 1s/2s/4s（最多 3 次），失败后 toast "新脚本通道断开，需手动检查主页" |
 | **Safari 隐私模式 localStorage 抛错** | **Review 反馈 MAJOR-4**：localStorage 读 / 写都 try/catch，失败时静默 fallback 到 in-memory（字号偏好本会话内有效，刷新后回到默认 18px） |
 | 浏览器窄屏（< 900px） | sidebar 自动改为抽屉式，顶部按钮切换显隐（Review 反馈 #7） |
@@ -389,7 +389,7 @@ window.addEventListener('beforeunload', (e) => {
 
 | 风险 | 缓解 |
 |------|------|
-| XSS via 用户脚本含 `<script>` | 客户端预览渲染用 `textContent`/escape 函数（**Review 反馈 #1**：已改为客户端，无服务端 XSS 面） |
+| XSS via 用户脚本含 `<script>` | 客户端预览渲染用 escapeHtml 函数（template literal 拼接前对 speaker/text 做转义；**Review 反馈 #1**：已改为客户端，无服务端 XSS 面；**F3**：删 textContent 提及，那是错误机制） |
 | 路径穿越（`?load=../../etc/passwd`） | `load_script_impl` 已有的文件名验证（必须 `script_*.json`、禁 `/`、`..`） |
 | 浏览器自动填充覆盖当前编辑 | `<textarea>` 不给 `id` / `name` 属性（Chrome/Safari 不识别 → 不入自动填充库） |
 | 主页 AI 生成与 /editor tab 失同步 | /editor 订阅 WebSocket `script_done` → toast 询问加载（Review 6） |
