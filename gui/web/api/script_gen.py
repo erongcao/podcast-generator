@@ -26,8 +26,8 @@ from gui.web.ws import ws_manager
 
 log = logging.getLogger(__name__)
 
-# 复用 Phase 5 的 _load_minimax_key
-from gui.web.api.synthesize import _load_minimax_key
+# 复用 Phase 5 的凭证 helper
+from gui.web.api.synthesize import _load_minimax_key, _load_volcengine_creds
 
 # ============================================================
 # 脚本存档目录（与 PySide6 GUI 共用）
@@ -90,9 +90,13 @@ class ScriptGenRequest(BaseModel):
     topic: str
     context: str = ""            # 原始素材
     custom: str = ""             # 附加要求
-    n_speakers: int = 2          # 2 或 3
-    api_key: str = ""            # 留空 → fallback 到 config.json
+    n_speakers: int = 2          # 2 或 3（仅 minimax；豆包硬 2-host 忽略）
+    api_key: str = ""            # 留空 → fallback 到 config.json（仅 minimax）
     show_name: str = "医学科普播客"
+    # === Phase 6+ 引擎选择 ===
+    engine: str = "minimax"      # "minimax" | "doubao"
+    appid: str = ""              # 豆包用；留空 → config.json / env
+    token: str = ""              # 豆包用；留空 → config.json / env
 
 
 class ScriptGenResponse(BaseModel):
@@ -130,12 +134,35 @@ def generate_script_thread(
     n_speakers: int,
     api_key: str,
     show_name: str,
+    engine: str = "minimax",
+    appid: str = "",
+    token: str = "",
 ) -> Optional[ScriptGenResponse]:
     """
-    同步跑生成。FastAPI 后台线程调起。
+    引擎分发器。FastAPI 后台线程调起。
+    - engine == "minimax" → MiniMax M3 chat completion
+    - engine == "doubao"  → 豆包 PodcastTTS preview 模式（只要台词，不出音频）
 
-    通过 ws_manager 推 log + progress + done/error。
+    通过 ws_manager 推 log + progress + script_done/error。
     """
+    if engine == "doubao":
+        return _generate_script_thread_doubao(
+            topic, context, custom, appid, token, show_name,
+        )
+    return _generate_script_thread_minimax(
+        topic, context, custom, n_speakers, api_key, show_name,
+    )
+
+
+def _generate_script_thread_minimax(
+    topic: str,
+    context: str,
+    custom: str,
+    n_speakers: int,
+    api_key: str,
+    show_name: str,
+) -> Optional[ScriptGenResponse]:
+    """原 MiniMax M3 chat completion 流程。"""
     # 1. api_key fallback
     api_key = (api_key or "").strip() or _load_minimax_key()
     if not api_key:
@@ -226,6 +253,166 @@ def generate_script_thread(
         ws_manager.push({
             "type": "error",
             "message": f"生成失败: {e}",
+            "traceback": traceback.format_exc()[-500:],
+        })
+        return None
+
+
+# ============================================================
+# 豆包 PodcastTTS 脚本生成（preview 模式，只要台词不要音频）
+# ============================================================
+def _doubao_texts_to_segments(texts: list) -> List[Dict[str, str]]:
+    """
+    把豆包返回 [{speaker: voice_id, text, round_id}, ...] 映射成
+    [{speaker: "主播甲" / "主播乙", text}, ...]。
+
+    规则：
+      1. 过滤 head_music（round_id=-1）和 tail_music（round_id=9999）
+      2. 按出场顺序找 unique speaker → 第 1 个 = 主播甲，第 2 个 = 主播乙
+      3. 第 3+ 个 speaker 静默丢弃（豆包硬 2-host）
+    """
+    # 1. 过滤伪 speaker
+    filtered = [
+        t for t in texts
+        if t.get("round_id") not in (-1, 9999)
+        and t.get("speaker") not in ("head_music", "tail_music")
+        and (t.get("text") or "").strip()
+    ]
+    # 2. 找 unique speaker（保序）
+    seen = []
+    for t in filtered:
+        spk = t.get("speaker", "")
+        if spk and spk not in seen:
+            seen.append(spk)
+    name_map = {}
+    for i, spk in enumerate(seen[:2]):  # 最多 2 个
+        name_map[spk] = "主播甲" if i == 0 else "主播乙"
+
+    # 3. 映射
+    out = []
+    for t in filtered:
+        spk = t.get("speaker", "")
+        text = (t.get("text") or "").strip()
+        name = name_map.get(spk)
+        if not name or not text:
+            continue
+        out.append({"speaker": name, "text": text})
+    return out
+
+
+def _generate_script_thread_doubao(
+    topic: str,
+    context: str,
+    custom: str,
+    appid: str,
+    token: str,
+    show_name: str,  # 豆包不接 show_name，留作日志展示
+) -> Optional[ScriptGenResponse]:
+    """豆包 PodcastTTS：preview 模式，只要 text，不出音频。"""
+    # 1. 凭证 fallback
+    if not (appid or "").strip() or not (token or "").strip():
+        creds = _load_volcengine_creds()
+        appid = (appid or "").strip() or creds["appid"]
+        token = (token or "").strip() or creds["token"]
+    if not appid or not token:
+        ws_manager.push({
+            "type": "error",
+            "message": "豆包 APP ID / Token 未配置（config.json / env 都没有）",
+        })
+        return None
+    if not topic.strip():
+        ws_manager.push({"type": "error", "message": "topic 不能为空"})
+        return None
+
+    ws_manager.push({
+        "type": "log", "level": "info",
+        "message": f"🤖 豆包 PodcastTTS 开始生成：主题「{topic[:30]}」",
+    })
+    ws_manager.push({"type": "progress", "done": 0, "total": 3})
+
+    t0 = time.time()
+    try:
+        # 拼 input_text：topic + 可选 context + 可选 custom
+        text = topic.strip()
+        if context.strip():
+            text += "\n\n" + context.strip()
+        if custom.strip():
+            text += "\n\n附加要求：" + custom.strip()
+        if show_name and show_name != "医学科普播客":
+            text = f"（节目：{show_name}）\n" + text
+
+        ws_manager.push({"type": "progress", "done": 1, "total": 3})
+        ws_manager.push({
+            "type": "log", "level": "info",
+            "message": f"⏳ 连接豆包 WebSocket（input {len(text)} 字，最长 2 分钟）…",
+        })
+
+        # 跑豆包（async → sync；用 /tmp 兜个 output_path 因为 only_nlp_text 模式不会写）
+        import asyncio
+        from doubao_podcast import generate_podcast
+        try:
+            result = asyncio.run(generate_podcast(
+                text=text,
+                output_path="/tmp/doubao_preview_unused.mp3",
+                appid=appid,
+                token=token,
+                only_nlp_text=True,
+            ))
+        except RuntimeError as e:
+            # 已有 event loop 的情况（Jupyter/嵌套），退到 run_coroutine_threadsafe 不可行
+            # 这里简单回退：在线程里跑新 loop
+            if "asyncio" in str(e) or "loop" in str(e).lower():
+                loop = asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(generate_podcast(
+                        text=text,
+                        output_path="/tmp/doubao_preview_unused.mp3",
+                        appid=appid,
+                        token=token,
+                        only_nlp_text=True,
+                    ))
+                finally:
+                    loop.close()
+            else:
+                raise
+
+        ws_manager.push({"type": "progress", "done": 2, "total": 3})
+
+        # 解析成 segments
+        texts = result.get("texts", []) or []
+        segments = _doubao_texts_to_segments(texts)
+        if not segments:
+            raise RuntimeError(
+                f"豆包返回 0 段（raw texts={len(texts)}，可能被 head/tail music 全过滤）"
+            )
+
+        script_text = segments_to_editor_text(segments)
+        saved_to = _format_for_save(segments, topic, script_text)
+        dt = time.time() - t0
+        ws_manager.push({
+            "type": "log", "level": "success",
+            "message": f"✅ 豆包生成 {len(segments)} 段，耗时 {dt:.1f}s，已存 {Path(saved_to).name}",
+        })
+        ws_manager.push({"type": "progress", "done": 3, "total": 3})
+        ws_manager.push({
+            "type": "script_done",
+            "script_text": script_text,
+            "count": len(segments),
+            "elapsed_sec": round(dt, 1),
+            "saved_to": saved_to,
+        })
+        return ScriptGenResponse(
+            script_text=script_text,
+            segments=segments,
+            count=len(segments),
+            elapsed_sec=round(dt, 1),
+            saved_to=saved_to,
+        )
+    except Exception as e:
+        import traceback
+        ws_manager.push({
+            "type": "error",
+            "message": f"豆包生成失败: {e}",
             "traceback": traceback.format_exc()[-500:],
         })
         return None

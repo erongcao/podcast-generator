@@ -160,15 +160,21 @@ def _load_minimax_key() -> str:
 
 def _load_volcengine_creds() -> dict:
     """
-    豆包凭证：config.json 的 volcengine.{appid, token} > env MINIMAX_APP_ID / MINIMAX_TOKEN > ""
+    豆包凭证加载（兼容两套字段名）：
+      config.json volcengine.{app_id, access_token} (config.py 默认 / 真实格式)
+      config.json volcengine.{appid, token}        (旧版别名)
+      env MINIMAX_APP_ID / MINIMAX_TOKEN
+
+    Returns: {"appid": "...", "token": "..."}
     """
     out = {"appid": "", "token": ""}
     if CONFIG_PATH.exists():
         try:
             cfg = _json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             ve = cfg.get("volcengine") or {}
-            out["appid"] = (ve.get("appid") or "").strip()
-            out["token"] = (ve.get("token") or "").strip()
+            # 兼容两套字段名：app_id / app_id → appid；access_token / token → token
+            out["appid"] = (ve.get("app_id") or ve.get("appid") or "").strip()
+            out["token"] = (ve.get("access_token") or ve.get("token") or "").strip()
         except Exception:
             pass
     out["appid"] = out["appid"] or _os.environ.get("MINIMAX_APP_ID", "").strip()

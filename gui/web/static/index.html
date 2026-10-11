@@ -163,6 +163,13 @@
             <!-- AI 生成：填表 -->
             <div id="source-ai" class="source-panel" style="display:none;">
               <div class="form-row">
+                <label class="form-label">AI 引擎 *</label>
+                <select id="ai-engine" class="form-select">
+                  <option value="minimax">MiniMax M3（云端 chat · 支持 2/3 主持）</option>
+                  <option value="doubao">豆包 PodcastTTS（云端 WebSocket · 硬 2 主持）</option>
+                </select>
+              </div>
+              <div class="form-row">
                 <label class="form-label">主题 *</label>
                 <input type="text" class="form-input" id="ai-topic"
                        placeholder="如：高血压患者能不能吃鸡蛋">
@@ -177,7 +184,7 @@
                 <input type="text" class="form-input" id="ai-custom"
                        placeholder="可空。如「风格再幽默一点」「加入一个病人提问环节」">
               </div>
-              <div class="form-row">
+              <div class="form-row" id="ai-n-speakers-row">
                 <label class="form-label">主持人</label>
                 <select id="ai-n-speakers" class="form-select">
                   <option value="2">2 主持人（甲+乙）</option>

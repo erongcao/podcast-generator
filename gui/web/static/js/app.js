@@ -360,19 +360,43 @@
     $('#source-import').style.display = src === 'import' ? 'block' : 'none';
     $('#source-ai').style.display = src === 'ai' ? 'block' : 'none';
     if (src === 'import') fetchRecentScripts();
-    if (src === 'ai') {
-      // 显示 / 隐藏 key 提示
-      const mmx = window._creds?.minimax;
+    if (src === 'ai') updateAiHint();
+  }
+  $('#script-source').addEventListener('change', switchScriptSource);
+
+  // ========== AI 引擎切换（minimax / doubao） ==========
+  function updateAiHint() {
+    const engine = $('#ai-engine')?.value || 'minimax';
+    const mmx = window._creds?.minimax;
+    const ve = window._creds?.volcengine;
+    const hint = $('#ai-hint');
+    if (!hint) return;
+    // 豆包硬 2-host：隐藏主持人下拉
+    const speakersRow = $('#ai-n-speakers-row');
+    if (speakersRow) {
+      speakersRow.style.display = engine === 'doubao' ? 'none' : '';
+    }
+    if (engine === 'doubao') {
+      const ok = ve?.appid_present && ve?.token_present;
+      if (ok) {
+        hint.innerHTML =
+          `<span style="color:var(--color-forest);">✅ 豆包凭证已就绪（硬 2 主持，speaker 顺序自动识别）</span>`;
+      } else {
+        hint.innerHTML =
+          `<span style="color:var(--color-clay);">⚠ 豆包 APP ID / Token 未配置，生成会失败</span>`;
+      }
+    } else {
+      // minimax
       if (mmx?.present) {
-        $('#ai-hint').innerHTML =
+        hint.innerHTML =
           `<span style="color:var(--color-forest);">✅ MiniMax key 已就绪 (${mmx.prefix})</span>`;
       } else {
-        $('#ai-hint').innerHTML =
+        hint.innerHTML =
           `<span style="color:var(--color-clay);">⚠ MiniMax key 未配置，生成会失败</span>`;
       }
     }
   }
-  $('#script-source').addEventListener('change', switchScriptSource);
+  $('#ai-engine')?.addEventListener('change', updateAiHint);
 
   // ========== 导入历史脚本 ==========
   async function fetchRecentScripts() {
@@ -431,23 +455,27 @@
     }
   });
 
-  // ========== AI 生成（Phase 6） ==========
+  // ========== AI 生成（Phase 6+，双引擎） ==========
   $('#ai-generate-btn').addEventListener('click', async () => {
     const topic = $('#ai-topic').value.trim();
     if (!topic) {
       log('主题必填', 'warning');
       return;
     }
+    const engine = $('#ai-engine').value;
     const context = $('#ai-context').value.trim();
     const custom = $('#ai-custom').value.trim();
     const n = parseInt($('#ai-n-speakers').value, 10);
-    const apiKey = $('#cred-api-key').value.trim();  // 留空用 config.json
+    const apiKey = $('#cred-api-key').value.trim();   // minimax 用
+    const appid = $('#cred-app-id').value.trim();     // 豆包用
+    const token = $('#cred-token').value.trim();      // 豆包用
 
     const btn = $('#ai-generate-btn');
     btn.disabled = true;
     btn.textContent = '⏳ 生成中…';
-    window._aiInFlight = true;  // 区分合成错误和生成错误
-    log(`🤖 提交生成：主题「${topic}」`, 'info');
+    window._aiInFlight = true;
+    const engineLabel = engine === 'doubao' ? '豆包 PodcastTTS' : 'MiniMax M3';
+    log(`🤖 提交生成（${engineLabel}）：主题「${topic}」`, 'info');
 
     try {
       const res = await fetch('/api/script/generate', {
@@ -457,13 +485,19 @@
           topic, context, custom,
           n_speakers: n,
           api_key: apiKey,
+          engine,
+          appid,
+          token,
         }),
       });
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.detail || `HTTP ${res.status}`);
       }
-      log('⏳ 已提交，后台跑 MiniMax M3…最长 4 分钟', 'info');
+      const waitMsg = engine === 'doubao'
+        ? '⏳ 已提交，后台跑豆包 WebSocket…最长 2 分钟'
+        : '⏳ 已提交，后台跑 MiniMax M3…最长 4 分钟';
+      log(waitMsg, 'info');
     } catch (e) {
       log(`❌ 提交失败: ${e.message}`, 'error');
       btn.disabled = false;

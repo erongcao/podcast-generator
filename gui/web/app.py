@@ -403,7 +403,7 @@ async def api_script_generate(
     req: ScriptGenRequest,
     background: BackgroundTasks,
 ):
-    """MiniMax M3 异步生成脚本。WebSocket 推 log + progress + script_done。"""
+    """Phase 6+: 引擎分发（minimax M3 / 豆包 PodcastTTS）。WebSocket 推 log + progress + script_done。"""
     background.add_task(
         generate_script_thread,
         req.topic,
@@ -412,6 +412,9 @@ async def api_script_generate(
         req.n_speakers,
         req.api_key,
         req.show_name,
+        req.engine,
+        req.appid,
+        req.token,
     )
     return {"status": "started", "topic": req.topic}
 
