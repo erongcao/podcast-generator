@@ -240,6 +240,37 @@ function bindEvents() {
             });
         });
     }
+
+    // ---- Preview toggle ----
+    $('#preview-btn')?.addEventListener('click', togglePreview);
+}
+
+function togglePreview() {
+    const editor = $('#script-editor');
+    const previewPanel = $('#preview-panel');
+    const btn = $('#preview-btn');
+
+    if (state.mode === 'edit') {
+        // 切到 preview
+        if (lastSegments.length === 0) {
+            toast('当前文本 parse 失败或为空，无可预览内容', 'warning');
+            return;
+        }
+        const html = lastSegments.map(s =>
+            `<hr><h2>${escapeHtml(s.speaker)}</h2><p>${escapeHtml(s.text)}</p>`
+        ).join('');
+        previewPanel.innerHTML = html;
+        editor.hidden = true;
+        previewPanel.hidden = false;
+        btn.textContent = '编辑 ◑';
+        state.mode = 'preview';
+    } else {
+        // 切回 edit
+        editor.hidden = false;
+        previewPanel.hidden = true;
+        btn.textContent = '预览 ◐';
+        state.mode = 'edit';
+    }
 }
 
 let lastSegments = [];   // 缓存给 preview 用
