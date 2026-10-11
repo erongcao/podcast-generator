@@ -243,6 +243,57 @@ function bindEvents() {
 
     // ---- Preview toggle ----
     $('#preview-btn')?.addEventListener('click', togglePreview);
+
+    // ---- 字号 + 全屏 ----
+    $('#font-decrease-btn')?.addEventListener('click', () => changeFontSize(-2));
+    $('#font-increase-btn')?.addEventListener('click', () => changeFontSize(+2));
+    $('#fullscreen-btn')?.addEventListener('click', toggleFullscreen);
+
+    // ---- 窄屏抽屉（顶栏按钮：动态注入，因为窄屏才需要） ----
+    injectDrawerToggle();
+}
+
+function changeFontSize(delta) {
+    const next = Math.max(14, Math.min(26, state.fontSize + delta));
+    if (next === state.fontSize) return;   // F4: 到边界就不弹 toast
+    state.fontSize = next;
+    applyFontSize();
+    if (!lsSet('editor.fontSize', String(next))) {
+        // F4 (Review MAJOR-4): Safari 隐私模式 → 静默 fallback，toast 不刷屏
+        toast('字号偏好无法持久化（浏览器隐私模式？）', 'warning', 2000);
+    }
+}
+
+function toggleFullscreen() {
+    document.documentElement.classList.toggle('fullscreen');
+    const btn = $('#fullscreen-btn');
+    if (btn) btn.textContent = document.documentElement.classList.contains('fullscreen') ? '⛶ 退出全屏' : '⛶ 全屏';
+}
+
+function injectDrawerToggle() {
+    const topbarRight = $('.topbar-right');
+    if (!topbarRight) return;   // 防御性：万一 HTML 改了没有 target
+
+    // 顶栏右区插入一个"☰ 段列表"按钮，仅在 ≤900px 时显示
+    const btn = document.createElement('button');
+    btn.id = 'sidebar-toggle-btn';
+    btn.className = 'btn btn-small';
+    btn.textContent = '☰ 段列表';
+    btn.setAttribute('aria-label', '切换段列表');
+    btn.hidden = window.innerWidth > 900;   // 默认隐藏
+    btn.addEventListener('click', () => {
+        document.getElementById('editor-sidebar').classList.toggle('open');
+    });
+    topbarRight.appendChild(btn);
+
+    // 窗口 resize 时切换显隐（只改 hidden，不重建按钮）
+    window.addEventListener('resize', () => {
+        btn.hidden = window.innerWidth > 900;
+        // 宽屏时确保 sidebar 不带 open class（避免桌面布局卡在抽屉状态）
+        if (window.innerWidth > 900) {
+            document.getElementById('editor-sidebar').classList.remove('open');
+        }
+    });
 }
 
 function togglePreview() {
