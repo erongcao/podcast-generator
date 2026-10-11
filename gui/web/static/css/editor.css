@@ -176,6 +176,12 @@ body {
     word-wrap: break-word;
 }
 
+.editor-textarea:focus-visible {
+    /* 键盘焦点时给个内嵌 box-shadow，避免 outline:none 屏蔽无障碍指示 */
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--color-sky-dark);
+}
+
 .preview-panel {
     flex: 1;
     overflow-y: auto;
@@ -332,9 +338,26 @@ html.fullscreen .editor-main {
     z-index: 9999;
 }
 
+/* Fullscreen 必须把顶栏/工具栏抬到 main 之上，否则全屏后用户点不到退出按钮 */
+html.fullscreen .editor-topbar,
+html.fullscreen .editor-toolbar {
+    position: relative;
+    z-index: 10000;
+}
+
 /* ===================== 通用按钮样式补全（theme.css 没有 .btn-small） ===================== */
 
 .btn-small {
-    font-size: 13px;
+    /* .btn 在 theme.css 已经 font-size:13px，这里只补 padding */
     padding: 4px 10px;
+}
+
+/* ===================== prefers-reduced-motion (WCAG 2.3.3) ===================== */
+@media (prefers-reduced-motion: reduce) {
+    .toast {
+        animation: none;
+    }
+    .editor-sidebar {
+        transition: none;
+    }
 }
