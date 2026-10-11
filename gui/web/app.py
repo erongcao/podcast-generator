@@ -96,7 +96,24 @@ app.mount(
 async def on_startup():
     import asyncio
     ws_manager.set_loop(asyncio.get_running_loop())
-    log_path = OUTPUT_DIR / "web_server.log"
+
+    # 信号兜底：捕获 SIGTERM / SIGINT（uvicorn 转发的硬杀信号），写 log 留死机痕迹。
+    # 必须在 startup 注册；on_shutdown 才注册就晚了（uvicorn 已经在 graceful shutdown）。
+    import signal
+    import sys
+
+    def _on_signal(signum, _frame):
+        log_path = OUTPUT_DIR / "web_server.log"
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"server killed by signal {signum} at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+    except ValueError:
+        # 非主线程无法注册（理论上不会，BackgroundTasks 是 thread pool）
+        pass
 
 
 @app.on_event("shutdown")
@@ -105,21 +122,6 @@ async def on_shutdown():
     log_path = OUTPUT_DIR / "web_server.log"
     with log_path.open("a", encoding="utf-8") as f:
         f.write("server stopped (graceful) at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
-
-    # SIGKILL / 断电 / OOM 不会触发 on_shutdown，所以下次崩了还是看不到。
-    # 信号兜底：捕获 SIGTERM / SIGINT（uvicorn 转发的硬杀信号），写到 stderr 落 log。
-    import signal
-    import sys
-    def _on_signal(signum, _frame):
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(f"server killed by signal {signum} at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
-        sys.exit(0)
-    try:
-        signal.signal(signal.SIGTERM, _on_signal)
-        signal.signal(signal.SIGINT, _on_signal)
-    except ValueError:
-        # 非主线程无法注册（理论上不会，BackgroundTasks 是 thread pool）
-        pass
 
 
 @app.get("/")
