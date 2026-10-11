@@ -153,8 +153,110 @@ function applyFontSize() {
     document.documentElement.style.setProperty('--editor-font-size', `${state.fontSize}px`);
 }
 
-// 占位 — 后续 task 替换
-function bindEvents() { /* Task 6/7/8 填充 */ }
+function bindEvents() {
+    // textarea input → dirty + parse debounce
+    const editor = $('#script-editor');
+    let parseTimer = null;
+
+    editor.addEventListener('input', () => {
+        if (!state.dirty) {
+            state.dirty = true;
+            updateTitle();
+        }
+        if (parseTimer) clearTimeout(parseTimer);
+        // 大脚本（>50KB）改 1000ms 防抖
+        const delay = editor.value.length > 50000 ? 1000 : 500;
+        parseTimer = setTimeout(refreshParse, delay);
+    });
+
+    // 历史下拉 change → load
+    const recentSel = $('#recent-scripts-select');
+    if (recentSel) {
+        recentSel.addEventListener('change', async () => {
+            const name = recentSel.value;
+            if (!name) return;
+            if (state.dirty && !confirm('当前编辑未保存，确定载入其他脚本？')) {
+                recentSel.value = '';
+                return;
+            }
+            await loadScriptFromUrl(name);
+            recentSel.value = '';
+        });
+    }
+
+    // dirty 监听 textarea 值变化的兜底（discard / loadScriptFromUrl 也走 input）
+    // F5 已在 loadScriptFromUrl 用 dispatchEvent(new Event('input')) 处理
+}
+
+let lastSegments = [];   // 缓存给 preview 用
+
+async function refreshParse() {
+    const editor = $('#script-editor');
+    const text = editor.value;
+    const status = $('#parse-status');
+    const segList = $('#segment-list');
+
+    if (!text.trim()) {
+        status.textContent = 'ⓘ 0 段 · 0 字';
+        status.classList.remove('error');
+        segList.innerHTML = '<li class="sidebar-empty">暂无段落</li>';
+        lastSegments = [];
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/parse', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({text}),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        lastSegments = data.segments || [];
+
+        // ⓘ 顶部统计
+        const speakersStr = Object.entries(data.speakers || {})
+            .map(([sp, n]) => `${sp}×${n}`).join(' · ');
+        status.textContent = `ⓘ ${data.count} 段 · ${text.length} 字${speakersStr ? ' · ' + speakersStr : ''}`;
+        status.classList.remove('error');
+
+        // sidebar 段列表
+        segList.innerHTML = '';
+        data.segments.forEach((seg, i) => {
+            const li = document.createElement('li');
+            li.innerHTML = `<span class="seg-idx">${String(i + 1).padStart(2, '0')}</span><span class="seg-speaker">${escapeHtml(seg.speaker)}</span><span class="seg-chars">${seg.text.length}字</span>`;
+            li.addEventListener('click', () => jumpToSegment(i, data.segments));
+            segList.appendChild(li);
+        });
+    } catch (e) {
+        status.textContent = `❌ parse 失败: ${e.message}`;
+        status.classList.add('error');
+        // sidebar 留旧值，不清空
+    }
+}
+
+function jumpToSegment(index, segments) {
+    // 简单实现：在 textarea 里找前 index+1 个 speaker marker，把光标放那儿
+    const editor = $('#script-editor');
+    const text = editor.value;
+    const target = segments[index];
+    if (!target) return;
+
+    // 找前 N 个 "【target.speaker】" 的位置
+    let pos = -1;
+    const marker = `【${target.speaker}】`;
+    for (let i = 0; i <= index; i++) {
+        pos = text.indexOf(marker, pos + 1);
+        if (pos === -1) return;   // 找不到
+    }
+
+    editor.focus();
+    editor.setSelectionRange(pos, pos + marker.length);
+    // 滚动到该位置（粗略：用 textarea 的 scrollTop 比例）
+    const ratio = pos / text.length;
+    editor.scrollTop = editor.scrollHeight * ratio;
+}
 
 function connectWebSocket() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
