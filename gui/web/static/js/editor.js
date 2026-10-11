@@ -155,7 +155,104 @@ function applyFontSize() {
 
 // 占位 — 后续 task 替换
 function bindEvents() { /* Task 6/7/8 填充 */ }
-function connectWebSocket() { /* Task 6 填充 */ }
+
+function connectWebSocket() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws`;
+
+    if (state.wsGivingUp) return;   // 已放弃，不再尝试
+
+    try {
+        state.ws = new WebSocket(url);
+    } catch (e) {
+        scheduleWsReconnect();
+        return;
+    }
+
+    state.ws.onopen = () => {
+        state.wsAttempts = 0;   // F2: 成功重连后清零
+    };
+
+    state.ws.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+        if (msg.type === 'script_done') {
+            handleScriptDone(msg);
+        }
+    };
+
+    state.ws.onclose = () => {
+        scheduleWsReconnect();
+    };
+
+    state.ws.onerror = () => {
+        // onclose 也会触发，这里不重复提示
+    };
+}
+
+function scheduleWsReconnect() {
+    if (state.wsAttempts >= state.wsMaxAttempts) {
+        if (!state.wsGivingUp) {
+            state.wsGivingUp = true;
+            toast('新脚本通道断开，需手动检查主页', 'warning', 0);
+        }
+        return;
+    }
+    const delays = [1000, 2000, 4000];
+    const delay = delays[state.wsAttempts] || 4000;
+    state.wsAttempts++;
+    setTimeout(connectWebSocket, delay);
+}
+
+function handleScriptDone(msg) {
+    // 缓存 + 弹 toast，让用户决定是否加载
+    state.pendingScriptLoad = msg;
+    // script_gen.py 的 script_done payload 没有 topic 字段，
+    // 但有 saved_to（如 script_20261011_145102_脾硬化.json）→ 从文件名解析
+    const topic = extractTopicFromSavedTo(msg.saved_to) || 'AI 生成';
+    const t = toast(`主页 AI 生成了新脚本「${topic}」，点击加载？`, 'info', 0);
+    t.addEventListener('click', () => loadPendingScript(t));
+}
+
+function extractTopicFromSavedTo(savedTo) {
+    if (!savedTo) return null;
+    // saved_to = ".../script_20261011_145102_脾硬化.json"
+    const m = savedTo.match(/script_\d{8}_\d{6}_(.+?)\.json$/);
+    return m ? m[1].replace(/_/g, ' ') : null;
+}
+
+async function loadPendingScript(toastEl) {
+    const msg = state.pendingScriptLoad;
+    if (!msg) {
+        if (toastEl) toastEl.remove();   // 取消路径也清掉死按钮
+        return;
+    }
+
+    // F1: dirty 检查，避免静默覆盖 + beforeunload 二次弹窗
+    if (state.dirty) {
+        if (!confirm('当前编辑未保存，确定加载新脚本？')) {
+            // 取消 → 保留 pendingScriptLoad 让用户稍后还能再点；
+            // 但这个 toast 已经没意义了（用户刚拒），直接关
+            if (toastEl) toastEl.remove();
+            return;
+        }
+        state.dirty = false;   // 先清 dirty，避免 beforeunload 再弹
+    }
+
+    // 接受 → 提交所有状态更新
+    state.pendingScriptLoad = null;
+    if (toastEl) toastEl.remove();
+
+    // 把 AI 生成的脚本灌入编辑器
+    const editor = $('#script-editor');
+    editor.value = msg.script_text || '';
+    editor.dispatchEvent(new Event('input'));
+    state.snapshot = editor.value;
+    state.topic = extractTopicFromSavedTo(msg.saved_to) || 'AI 生成';
+    state.loadedName = null;   // AI 生成不走文件名路径
+    updateTitle();
+    toast('已加载 AI 生成脚本（记得手动保存）', 'success');
+}
 
 // ============================================================
 // 启动
