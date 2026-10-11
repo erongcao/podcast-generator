@@ -47,13 +47,15 @@ gui/web/
 | 文件 | 改动 |
 |------|------|
 | `gui/web/app.py` | 加 `GET /editor` 路由 + 注册 editor router（FastAPI APIRouter） |
-| `gui/web/api/script_gen.py` | 加 `preview_impl(text)` 和 `export_impl(name, format)` 两个函数 |
+| `gui/web/api/editor.py` | **同时**持有 export 路由和 export_impl 函数（impl 与 route 同文件，不跨模块跳） |
+| `gui/web/api/script_gen.py` | 不动（保持其"脚本生成"单一职责） |
 
 ### 不动的文件
 
 - `parse.py`（复用 `/api/parse` 拿 segments）
 - `synthesize.py` / `voices.py`（无关）
 - `index.html` / `app.js`（主页加一个"📝 打开编辑器"按钮跳转 `/editor`，**target="_blank"**）
+- `<textarea>` 不给 `id` 或 `name` 属性（防止 Chrome/Safari 自动填充回旧版本覆盖当前编辑）
 
 ### 路由表（新增）
 
@@ -61,44 +63,33 @@ gui/web/
 |------|------|------|
 | GET | `/editor` | 返回 `editor.html` |
 | GET | `/editor?load=<script_name>` | 同上，URL 带 load 参数自动灌入脚本 |
-| POST | `/api/scripts/preview` | body `{text}` → `{html, segments, n_segments, speakers, char_count}` |
+| ~~`POST /api/scripts/preview`~~ | **删除** | 见下节，直接扩展 `/api/parse` |
 | GET | `/api/scripts/export?name=<>&format=<raw\|rendered>` | 流式下载 .md 文件 |
+
+> **review 反馈 #1**：删除 `/api/scripts/preview`。预览 HTML 是客户端的事：客户端拿到 segments 后用 template literal 渲染即可，零额外服务。再造一个端点会让 parser 改动需要在两处同步。
 
 ---
 
 ## 第 2 节：API 详细设计
 
-### `POST /api/scripts/preview`
+### `POST /api/scripts/preview` ~~已删除~~
 
-**Request**
-```json
-{ "text": "---\n【主播甲】\ntext..." }
-```
+**Review 反馈 #1（已采纳）**：原计划创建 `/api/scripts/preview` 端点返回 `{html, segments, n_segments, speakers, char_count}`。但 95% 内容已在 `/api/parse` 暴露，多余的 `html` 是客户端渲染，`char_count` = `len(text)` 客户端也能算。**删除该端点**。
 
-**Response 200**
-```json
-{
-  "html": "<hr>\n<h2>主播甲</h2>\n<p>text...</p>\n<hr>...",
-  "segments": [
-    {"speaker": "主播甲", "text": "..."},
-    {"speaker": "主播乙", "text": "..."}
-  ],
-  "n_segments": 32,
-  "speakers": {"主播甲": 16, "主播乙": 16},
-  "char_count": 5862
-}
-```
+**替代方案**：
+- 编辑器调现有 `/api/parse` 拿 segments（已有）
+- HTML 渲染在客户端用 template literal 完成
+- 字符数 = `editor.value.length`（零成本）
 
-**Response 400**
-```json
-{ "detail": "parse 失败: 找不到 speaker marker" }
-```
+### 复用 vs 新增端点清单（修订）
 
-**实现要点**：
-- 调现有 `gui.web.api.parse.parse_script_lines(text)` 拿 segments
-- 渲染：每段输出 `<hr>\n<h2>{speaker}</h2>\n<p>{text}</p>`（第一段的 `<hr>` 也输出，方便预览里看段分隔）
-- 用 Python `html.escape()` 防 XSS（用户脚本是医生写的医学内容，可能含 `<` `>`）
-- 字符统计用 `len(text)`
+| 端点 | 状态 | 说明 |
+|------|------|------|
+| `GET /api/scripts/recent` | 已有 | 编辑器顶部"载入历史"下拉复用 |
+| `GET /api/scripts/get` | 已有（2026-10-11 新加） | 编辑器 URL `?load=` 参数走这个 |
+| `POST /api/scripts/save` | 已有 | "保存"按钮复用 |
+| `POST /api/scripts/preview` | **删除** | 客户端渲染替代 |
+| `GET /api/scripts/export` | **新增** | 下载按钮（在 `editor.py`） |
 
 ### `GET /api/scripts/export?name=...&format=...`
 
@@ -179,28 +170,33 @@ gui/web/
 ### CSS 布局
 
 - **grid-template-columns: 1fr 280px** —— 左编辑区 + 右段列表
+- **窄屏适配**：`@media (max-width: 900px) { grid-template-columns: 1fr }`，sidebar 变成抽屉式，顶部加按钮切换显隐
 - 顶栏 sticky `top: 0; z-index: 100`
 - 全屏模式：`<html>` 加 `class="fullscreen"`，编辑器区 `position: fixed; inset: 0; z-index: 9999`
-- 字号：用 CSS variable `--editor-font-size`，按钮 ± 改这个变量
+- 字号：用 CSS variable `--editor-font-size`，按钮 ± 改这个变量，**持久化到 `localStorage`**，避免每次开页都重置
 - 复用 `theme.css` 的色板变量（`--color-*`），不重复定义
+- 所有 `<button>` 加 `aria-label`（无文字按钮必须，可视按钮可选）
 
 ### JS 模块（editor.js ~200 行）
 
 ```
 editor.js
-├── State { dirty, snapshot, fontSize, mode: 'edit'|'preview', topic }
+├── State { dirty, snapshot, fontSize, mode: 'edit'|'preview', topic, loadedName }
 ├── Init
-│   ├── 读 URL ?load=<name> → fetch /api/scripts/get 灌入
-│   ├── 绑定顶栏按钮（保存/放弃/下载/预览/字号/全屏/替换）
+│   ├── 读 URL ?load=<name> → fetch /api/scripts/get 灌入，loadedName=...
+│   ├── 读 localStorage.editor.fontSize → 还原字号
+│   ├── 绑定顶栏按钮（保存/放弃/下载/预览/字号/全屏）
 │   ├── 绑定 sidebar 跳转
-│   └── 装 beforeunload dirty 检查
+│   ├── 装 beforeunload dirty 检查
+│   └── 装 WebSocket 订阅 → 监听 script_done → toast "主页 AI 生成了新脚本，是否加载？"
 ├── Save / Discard / Export
-├── Font size / Fullscreen
-├── Cmd+H 自定义替换（覆盖浏览器 hide window 行为，仅在编辑器内）
-├── Parse debounce（500ms，复用主页模式）
+├── Font size / Fullscreen（写 localStorage）
+├── Cmd+F（浏览器原生 find，**不拦截 Cmd+H**）
+├── Cmd+S → 触发保存（浏览器默认是"保存网页"，拦截换成我们的）
+├── Parse debounce（500ms，文本 >50KB 改 1000ms）
 │   └── 触发 /api/parse → 更新右上 ⓘ 文本 + 渲染 sidebar 段列表
-└── Preview toggle
-    ├── mode='preview' → fetch /api/scripts/preview → 注入左侧（替换 textarea）
+└── Preview toggle（客户端渲染，零网络请求）
+    ├── mode='preview' → 用 segments template literal 渲染 HTML，注入左侧（替换 textarea）
     └── mode='edit' → 恢复 textarea + sidebar
 ```
 
@@ -282,14 +278,17 @@ input事件
      → ok → editor.value = snapshot; 触发 input 事件重 parse → dirty=false
 ```
 
-### 4.5 预览切换
+### 4.5 预览切换（客户端渲染）
+
+**Review 反馈 #1（已采纳）**：preview 完全在客户端完成，不调服务端端点。
 
 ```
 [预览 ◐] 按钮
   → mode='preview':
-     → fetch POST /api/scripts/preview {text: editor.value}
-       ← 200 → 隐藏 textarea + sidebar，注入 <div class="preview">{html}</div> 到左侧
-       ← 400 → toast "预览失败: parse 错误"
+     → 用当前 sidebar 缓存的 segments（或实时调 /api/parse 拿新值）
+     → 客户端 template literal: html = segments.map(s => `<hr><h2>${escape(s.speaker)}</h2><p>${escape(s.text)}</p>`).join('')
+     → 隐藏 textarea + sidebar，注入 <div class="preview">{html}</div> 到左侧
+     → **用 textContent / escape 函数防 XSS**（用户脚本可能含 `<script>`）
   → mode='edit': 恢复 textarea + sidebar, preview div 隐藏
 ```
 
@@ -305,15 +304,25 @@ input事件
 
 **重要**：用户从未保存过的纯文本也能下载 —— 不强制先存。
 
-### 4.7 Cmd+H 替换
+### 4.7 Cmd+F 查找（不劫持 Cmd+H）
 
-```
-textarea 内按 Cmd+H
-  → e.preventDefault() 阻止浏览器 hide window（macOS Cmd+H 在 textarea 内默认行为是隐藏应用，需拦截）
-  → 在编辑器右下角浮一个 inline replace bar:
-    [查找: _________] [替换为: _________] [替换] [全部] [关闭]
-  → 替换：从光标向下找下一个匹配，选中 → 点替换改写 → 自动找下一个
-  → Cmd+G 在该区域找下一个匹配
+**Review 反馈 #5（已采纳）**：原计划劫持 Cmd+H 实现自定义替换。**删除**。理由：
+
+- macOS Cmd+H 是 OS 级 hide window 语义，用户肌肉记忆强，劫持会持续困惑
+- 浏览器原生 Cmd+F 在 textarea 内可用，跳到下一个匹配足够日常使用
+- 真要全局替换，浏览器 Cmd+F 找不到时给个 toast 提示 "暂不支持全局替换"
+
+**保留**：Cmd+S → 触发保存（拦截浏览器"保存网页"默认行为）。
+
+```javascript
+document.addEventListener('keydown', (e) => {
+  if (!(e.metaKey || e.ctrlKey)) return;
+  if (e.key === 's' || e.key === 'S') {
+    e.preventDefault();
+    saveScript();  // 调 /api/scripts/save
+  }
+  // 不拦截 Cmd+H / Ctrl+H
+});
 ```
 
 ### 4.8 全屏 + 字号
@@ -324,9 +333,10 @@ textarea 内按 Cmd+H
   → CSS: .fullscreen .editor-grid { position: fixed; inset: 0; z-index: 9999; background: white }
 
 [字号 − A+]
-  → fontSize -= 2 / += 2, clamp 12..24
+  → fontSize -= 2 / += 2, **clamp 14..26**（Review 反馈 #4：用户 60+，12pt 太小）
   → <html style="--editor-font-size: {fontSize}pt">
   → CSS: textarea { font-size: var(--editor-font-size); line-height: 1.6 }
+  → 写 localStorage.editor.fontSize（避免每次开页重置）
 ```
 
 ### 4.9 离开提示
@@ -354,8 +364,13 @@ window.addEventListener('beforeunload', (e) => {
 | 网络断开（fetch 失败） | catch → toast "网络错误:<msg>", 状态保留 |
 | 段数 > 100 | sidebar 自动滚动定位，不懒加载 |
 | 文本 > 50KB | parse debounce 改 1000ms（避免大脚本卡） |
-| Safari Cmd+H | macOS Cmd+H 默认 hide window，textarea 内用 `e.metaKey && e.key === 'h'` 拦截 |
-| 预览时按保存 | 不允许 —— 切回 edit 模式才能保存（编辑预览不可编辑是常态） |
+| ~~Safari Cmd+H~~ | **Review 反馈 #5 已删除**，不拦截 |
+| 预览时按保存 | 不允许 —— 切回 edit 模式才能保存 |
+| **主页 AI 生成（script_done via WS）** | **Review 反馈 #6**：/editor 订阅 WebSocket，收到 `script_done` → toast "主页 AI 生成了新脚本「<topic>」，点击加载？"，点 → `?load=` 跳转逻辑 |
+| 浏览器窄屏（< 900px） | sidebar 自动改为抽屉式，顶部按钮切换显隐（Review 反馈 #7） |
+| 字号 localStorage 持久化 | 关页重开沿用上次值（Review 反馈 #4） |
+| Cmd+S | 拦截浏览器"保存网页" → 调保存按钮（Review 反馈 新增） |
+| `<textarea>` 无 id/name | **Review 反馈 新增**：防止 Chrome/Safari 自动填充回旧版覆盖当前编辑 |
 
 ---
 
@@ -363,12 +378,18 @@ window.addEventListener('beforeunload', (e) => {
 
 | 风险 | 缓解 |
 |------|------|
-| XSS via 用户脚本含 `<script>` | `html.escape()` 转义所有用户输入 |
+| XSS via 用户脚本含 `<script>` | 客户端预览渲染用 `textContent`/escape 函数（**Review 反馈 #1**：已改为客户端，无服务端 XSS 面） |
 | 路径穿越（`?load=../../etc/passwd`） | `load_script_impl` 已有的文件名验证（必须 `script_*.json`、禁 `/`、`..`） |
-| 预览请求大 payload（50KB+） | 限文本 1MB（413 拒绝），不缓存 |
+| 浏览器自动填充覆盖当前编辑 | `<textarea>` 不给 `id` / `name` 属性（Chrome/Safari 不识别 → 不入自动填充库） |
+| 主页 AI 生成与 /editor tab 失同步 | /editor 订阅 WebSocket `script_done` → toast 询问加载（Review 6） |
+| 浏览器窄屏 sidebar 抢占编辑区 | `@media (max-width:900px)` 切单列 + 抽屉式 sidebar（Review 7） |
+| 60+ 用户字号过小 | clamp 14..26 + localStorage 持久化（Review 4） |
+| Cmd+H 被劫持导致 macOS hide window 失效 | **删除 Cmd+H 劫持**（Review 5），Cmd+F 浏览器原生足够 |
+| 浏览器"保存网页"（Cmd+S）误触发 | 拦截 Cmd+S 调我们的保存逻辑（Review 新增） |
 | beforeunload 在 SPA 内失效 | 用 `<a href="/editor">` 而非 SPA 路由，浏览器原生 beforeunload 即可触发 |
 | 长时间挂起导致 debounce 不触发 | onbeforeunload 时若有 pending debounce，flush 一次同步 parse |
-| textarea 自动换行不一致（用户偏好） | `white-space: pre-wrap` 强制保留换行，`word-wrap: break-word` 长破折号分行 |
+| textarea 自动换行不一致 | `white-space: pre-wrap` 强制保留换行，`word-wrap: break-word` 长破折号分行 |
+| 崩溃恢复（用户改 30 分钟没存浏览器死） | **YAGNI**：不实现。用户明确要"不自动存"，超出本 spec 范围 |
 
 ---
 
@@ -378,13 +399,17 @@ window.addEventListener('beforeunload', (e) => {
 |------|------|
 | 主页点跳转按钮 | 打开新 tab 显示 `/editor` |
 | 编辑器 `?load=<name>` | URL 带 name → 自动灌入内容 + snapshot 同步 |
-| 编辑 + 关闭 tab | 弹原生确认 |
+| 编辑 + 关闭 tab | 弹原生确认（beforeunload） |
 | 点保存 | toast 成功，dirty 变 false，snapshot 更新 |
 | 点放弃 | 编辑器内容回退到入页快照 |
-| 切预览 | 左侧 textarea 换为渲染 HTML |
+| 切预览 | 左侧 textarea 换为客户端渲染 HTML（无网络请求） |
 | 下载 .md | 浏览器下载对应文件，原文/渲染两种都试 |
-| 改字号 + 全屏 | CSS variable 立即更新 |
-| Cmd+H | 浮替换栏，替换+全部按钮可用 |
+| 改字号 + 全屏 | CSS variable 立即更新，刷新页面后字号沿用 |
+| Cmd+F | 浏览器原生 find 正常 |
+| Cmd+S | 不保存网页，调我们的保存逻辑 |
+| Cmd+H | 不拦截，正常 hide window |
+| 主页 AI 生成时 /editor tab | 收到 toast "新脚本已生成，加载？"，点 → 自动 load |
+| 浏览器窄屏（拖到 <900px） | sidebar 自动收起为抽屉 |
 | parse 失败时编辑 | 顶栏 ⓘ 显示 "❌", sidebar 留旧值，但编辑仍允许 |
 | XSS 注入测试 | 脚本含 `<script>alert(1)</script>` 不执行，预览里看到原文转义 |
 
