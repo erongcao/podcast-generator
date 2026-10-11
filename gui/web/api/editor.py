@@ -25,14 +25,18 @@ from gui.web.api.parse import parse_script_lines
 # ============================================================
 # sanitize_filename
 # ============================================================
-_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
+_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def sanitize_filename(name: str) -> str:
-    """把文件名里的 unsafe 字符替换成 `_`；空 / 纯空白 → "未命名脚本"。"""
+    """把文件名里的 unsafe 字符替换成 `_`；空 / 纯空白 → "untitled_script"。
+
+    中文 / 非 ASCII 保留原样（route 层会用 RFC 5987 percent-encode 进 header）。
+    """
     if not name or not name.strip():
-        return "未命名脚本"
-    return _UNSAFE_FILENAME_CHARS.sub("_", name)
+        return "untitled_script"
+    safe = _UNSAFE_FILENAME_CHARS.sub("_", name)
+    return safe.strip(" ._") or "untitled_script"
 
 
 # ============================================================

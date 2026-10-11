@@ -56,9 +56,11 @@ from gui.web.api.script_gen import (  # noqa: E402
     generate_script_thread,
     list_recent_scripts,
     save_script_impl,
+    load_script_impl,
     ScriptGenRequest,
     ScriptSaveRequest,
 )
+from gui.web.api.editor import export_impl  # noqa: E402
 
 STATIC_DIR = Path(__file__).parent / "static"
 HOST = "127.0.0.1"
@@ -99,8 +101,25 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    # 追加而非覆盖（write_text 会清掉整个 log，导致死机类型不可追溯）
     log_path = OUTPUT_DIR / "web_server.log"
-    log_path.write_text("server stopped at " + time.strftime("%Y-%m-%d %H:%M:%S"))
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("server stopped (graceful) at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+
+    # SIGKILL / 断电 / OOM 不会触发 on_shutdown，所以下次崩了还是看不到。
+    # 信号兜底：捕获 SIGTERM / SIGINT（uvicorn 转发的硬杀信号），写到 stderr 落 log。
+    import signal
+    import sys
+    def _on_signal(signum, _frame):
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"server killed by signal {signum} at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        sys.exit(0)
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+    except ValueError:
+        # 非主线程无法注册（理论上不会，BackgroundTasks 是 thread pool）
+        pass
 
 
 @app.get("/")
@@ -425,10 +444,64 @@ async def api_scripts_recent(limit: int = 20):
     return {"scripts": list_recent_scripts(limit=limit)}
 
 
+@app.get("/api/scripts/get")
+async def api_scripts_get(name: str):
+    """
+    读单个历史脚本（/api/scripts/recent 列出后点"加载"用）。
+    name 形如 script_20261011_145102_脾硬化.json。
+
+    返回 JSON：{topic, editor_text, segments, created_at, ...}
+    """
+    try:
+        return load_script_impl(name)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.post("/api/scripts/save")
 async def api_scripts_save(req: ScriptSaveRequest):
     """把当前编辑器内容存盘。"""
     return save_script_impl(req.script_text, req.topic)
+
+
+# ============================================================
+# /api/scripts/export — 下载已保存脚本为 .md
+# ============================================================
+@app.get("/api/scripts/export")
+async def api_scripts_export(name: str, format: str = "raw"):
+    """
+    导出已保存的脚本为 .md 文件（Content-Disposition: attachment 触发下载）。
+    name: script_20261011_*.json
+    format: raw | rendered
+    """
+    try:
+        text, filename = export_impl(name, format)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # 中文 / 非 ASCII filename 走 RFC 5987 (filename*=UTF-8''percent-encoded)，
+    # 否则 Starlette 用 latin-1 编码 header 直接抛 UnicodeEncodeError。
+    # ascii fallback = 纯 ASCII 切片（无中文时两者相同；浏览器优先用 filename*）
+    import urllib.parse
+    quoted = urllib.parse.quote(filename, safe="")
+    ascii_fallback = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    disposition = f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quoted}'
+
+    from fastapi.responses import Response
+    return Response(
+        content=text,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": disposition},
+    )
+
+
+# ============================================================
+# /editor — 全屏脚本编辑器页面
+# ============================================================
+@app.get("/editor")
+async def editor_index():
+    """全屏脚本编辑器页面（静态 HTML）。"""
+    return FileResponse(str(STATIC_DIR / "editor.html"))
 
 
 # ============================================================
