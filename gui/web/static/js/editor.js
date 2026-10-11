@@ -221,6 +221,25 @@ function bindEvents() {
             return '';
         }
     });
+
+    // ---- 下载 md ----
+    const dlBtn = $('#download-btn');
+    const dlMenu = $('#download-menu');
+    if (dlBtn && dlMenu) {
+        dlBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            dlMenu.hidden = !dlMenu.hidden;
+        });
+        document.addEventListener('click', () => { dlMenu.hidden = true; });
+        dlMenu.querySelectorAll('a').forEach(a => {
+            a.addEventListener('click', async (e) => {
+                e.preventDefault();
+                dlMenu.hidden = true;
+                const format = a.dataset.format;
+                await downloadMd(format);
+            });
+        });
+    }
 }
 
 let lastSegments = [];   // 缓存给 preview 用
@@ -436,6 +455,73 @@ async function saveScript() {
         btn.disabled = false;
         btn.textContent = originalText;
     }
+}
+
+// ============================================================
+// 下载导出（Task 9）
+// ============================================================
+
+async function downloadMd(format) {
+    const editor = $('#script-editor');
+    const text = editor.value;
+    const topic = state.topic || '未命名脚本';
+
+    // MINOR-3 / MAJOR-5: dirty 时用 Blob，干净时才走 export endpoint
+    if (state.dirty) {
+        // Blob 路径：直接用 editor.value
+        let blob;
+        let filename;
+        if (format === 'raw') {
+            blob = new Blob([text], {type: 'text/markdown;charset=utf-8'});
+            filename = `${sanitizeFilenameForDownload(topic)}.md`;
+        } else {
+            // rendered：用 lastSegments
+            const md = lastSegments.map(s =>
+                `---\n\n## ${escapeHtml(s.speaker)}\n\n${escapeHtml(s.text)}\n`
+            ).join('\n').trim() + '\n';
+            blob = new Blob([md], {type: 'text/markdown;charset=utf-8'});
+            filename = `${sanitizeFilenameForDownload(topic)}.md`;
+        }
+        triggerBlobDownload(blob, filename);
+        toast('已下载（dirty 状态，源是当前编辑器）', 'info');
+        return;
+    }
+
+    // 非 dirty：走服务端 export endpoint（确保拿到的是磁盘上的最新版）
+    if (!state.loadedName) {
+        toast('没有已保存的脚本可导出，请先保存', 'warning');
+        return;
+    }
+    try {
+        const url = `/api/scripts/export?name=${encodeURIComponent(state.loadedName)}&format=${format}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        // 从 Content-Disposition 拿服务端给的 filename
+        const cd = res.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename="([^"]+)"/);
+        const filename = m ? m[1] : `${sanitizeFilenameForDownload(topic)}.md`;
+        triggerBlobDownload(blob, filename);
+        toast('已下载 ✅', 'success');
+    } catch (e) {
+        toast(`下载失败: ${e.message}`, 'error');
+    }
+}
+
+function sanitizeFilenameForDownload(name) {
+    // F4: Blob 路径要自己起名字
+    return name.replace(/[<>:"/\\|?*]/g, '_').trim() || '未命名脚本';
+}
+
+function triggerBlobDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;   // F4
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ============================================================
