@@ -125,16 +125,6 @@ gui/web/
   body text...
   ```
 
-### 复用 vs 新增端点清单
-
-| 端点 | 状态 | 说明 |
-|------|------|------|
-| `GET /api/scripts/recent` | 已有 | 编辑器顶部"载入历史"下拉复用 |
-| `GET /api/scripts/get` | 已有（2026-10-11 新加） | 编辑器 URL `?load=` 参数走这个 |
-| `POST /api/scripts/save` | 已有 | "保存"按钮复用 |
-| `POST /api/scripts/preview` | **新增** | 预览面板 |
-| `GET /api/scripts/export` | **新增** | 下载按钮 |
-
 ---
 
 ## 第 3 节：前端页面布局 + JS 模块
@@ -145,7 +135,7 @@ gui/web/
 ┌─────────────────────────────────────────────────────────────────┐
 │ ☰  [返回主页]  │ 脾硬化 · 已修改 ✱ │ [字号 − A+] [全屏] │ │  ← 顶栏 (sticky)
 ├─────────────────────────────────────────────────────────────────┤
-│ [保存]    [放弃]  [下载md ▾]  [预览 ◐]  [替换]    │ ⓘ 32段 · 5862字 │
+│ [保存]    [放弃]  [下载md ▾]  [预览 ◐]   │ ⓘ 32段 · 5862字 │
 ├──────────────────────────────────────┬──────────────────────────┤
 │                                      │ 段列表 (sidebar)          │
 │  ┌────────────────────────────────┐  │ ────────                 │
@@ -170,7 +160,7 @@ gui/web/
 ### CSS 布局
 
 - **grid-template-columns: 1fr 280px** —— 左编辑区 + 右段列表
-- **窄屏适配**：`@media (max-width: 900px) { grid-template-columns: 1fr }`，sidebar 变成抽屉式，顶部加按钮切换显隐
+- **窄屏适配**：`@media (max-width: 900px) { grid-template-columns: 1fr }`，sidebar 变成抽屉式，**默认收起**，顶部按钮切换显隐
 - 顶栏 sticky `top: 0; z-index: 100`
 - 全屏模式：`<html>` 加 `class="fullscreen"`，编辑器区 `position: fixed; inset: 0; z-index: 9999`
 - 字号：用 CSS variable `--editor-font-size`，按钮 ± 改这个变量，**持久化到 `localStorage`**，避免每次开页都重置
@@ -181,23 +171,36 @@ gui/web/
 
 ```
 editor.js
-├── State { dirty, snapshot, fontSize, mode: 'edit'|'preview', topic, loadedName }
+├── State { dirty, snapshot, fontSize, mode: 'edit'|'preview', topic, loadedName, wsAttempts }
 ├── Init
-│   ├── 读 URL ?load=<name> → fetch /api/scripts/get 灌入，loadedName=...
-│   ├── 读 localStorage.editor.fontSize → 还原字号
+│   ├── 读 URL ?load=<name> → fetch /api/scripts/get 灌入，loadedName=<name>
+│   ├── 读 localStorage.editor.fontSize（try/catch 包裹，Safari 隐私模式抛错时静默 fallback 到 18px）
 │   ├── 绑定顶栏按钮（保存/放弃/下载/预览/字号/全屏）
 │   ├── 绑定 sidebar 跳转
 │   ├── 装 beforeunload dirty 检查
 │   └── 装 WebSocket 订阅 → 监听 script_done → toast "主页 AI 生成了新脚本，是否加载？"
+│        └── onclose 重连：wsAttempts++，线性 backoff 1s/2s/4s（最多 3 次），失败后 toast "新脚本通道断开，需手动检查主页"
 ├── Save / Discard / Export
-├── Font size / Fullscreen（写 localStorage）
+│   ├── Save 成功后更新 loadedName = newSavedName（让下载按钮走正确文件路径）
+│   └── Export 原文：if dirty → Blob from editor.value; else → fetch /api/scripts/export?format=raw&name=<loadedName>
+├── Font size / Fullscreen（写 localStorage，try/catch）
 ├── Cmd+F（浏览器原生 find，**不拦截 Cmd+H**）
 ├── Cmd+S → 触发保存（浏览器默认是"保存网页"，拦截换成我们的）
 ├── Parse debounce（500ms，文本 >50KB 改 1000ms）
 │   └── 触发 /api/parse → 更新右上 ⓘ 文本 + 渲染 sidebar 段列表
 └── Preview toggle（客户端渲染，零网络请求）
-    ├── mode='preview' → 用 segments template literal 渲染 HTML，注入左侧（替换 textarea）
+    ├── mode='preview' → 用 segments + escapeHtml() 渲染 HTML，注入左侧（替换 textarea）
     └── mode='edit' → 恢复 textarea + sidebar
+```
+
+**escapeHtml 实现**（防 XSS；**不能用 JS 全局 escape()，那个是 URL 编码**）：
+
+```javascript
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+  ));
+}
 ```
 
 ### 与主页的衔接
@@ -220,7 +223,8 @@ editor.js
 | 历史下拉 | ✅ | ✅ 编辑器自己带下拉（不依赖主页） |
 | 实时预览 | ❌ | ✅ 编辑器独有 |
 | 全屏 | ❌ | ✅ 编辑器独有 |
-| Cmd+H 替换 | ❌ | ✅ 编辑器独有 |
+| Cmd+H 替换 | ❌ | ❌（Review 反馈 #5：不劫持 macOS OS 语义） |
+| Cmd+S 保存 | ❌ | ✅ 编辑器独有（拦截浏览器"保存网页"） |
 
 ---
 
@@ -286,9 +290,9 @@ input事件
 [预览 ◐] 按钮
   → mode='preview':
      → 用当前 sidebar 缓存的 segments（或实时调 /api/parse 拿新值）
-     → 客户端 template literal: html = segments.map(s => `<hr><h2>${escape(s.speaker)}</h2><p>${escape(s.text)}</p>`).join('')
+     → 客户端 template literal: html = segments.map(s => `<hr><h2>${escapeHtml(s.speaker)}</h2><p>${escapeHtml(s.text)}</p>`).join('')
      → 隐藏 textarea + sidebar，注入 <div class="preview">{html}</div> 到左侧
-     → **用 textContent / escape 函数防 XSS**（用户脚本可能含 `<script>`）
+     → **用 escapeHtml 实现 (转义 &<>"') 防 XSS**（用户脚本可能含 `<script>`）
   → mode='edit': 恢复 textarea + sidebar, preview div 隐藏
 ```
 
@@ -297,12 +301,17 @@ input事件
 ```
 [下载md ▾] 下拉
   → "原文 .md":
-     → if 当前是已载入的脚本 → fetch GET /api/scripts/export?format=raw&name=<name> 触发浏览器下载
-     → if 是用户从未保存过的临时内容 → 前端用 Blob 直接生成 .md，触发下载 "未命名.md"
+     → if dirty=true → 前端用 Blob 从 editor.value 生成 .md 直接下载（不去服务端，避免下到旧文件）
+     → else → fetch GET /api/scripts/export?format=raw&name=<loadedName> 触发浏览器下载
   → "渲染 .md" → 同上但 format=rendered
+
+**loadedName 来源**：
+  - Init 阶段：URL ?load=<name> → loadedName = <name>
+  - Save 成功后：loadedName = newSavedName（服务端返回的）
+  - 从未保存过：loadedName = null，下载走"原文 .md"分支（dirty 必然 true）
 ```
 
-**重要**：用户从未保存过的纯文本也能下载 —— 不强制先存。
+**Review 反馈 MAJOR-5 + MINOR-3**：原 spec 没区分 dirty，导致用户编辑 20 分钟不存点下载会下到旧文件。**已修复**。
 
 ### 4.7 Cmd+F 查找（不劫持 Cmd+H）
 
@@ -362,11 +371,13 @@ window.addEventListener('beforeunload', (e) => {
 | 空编辑器按保存 | 允许存（topic="未命名脚本"+空文本），不拦 |
 | 同一脚本改两次保存 | 视为手动 save，每次生成新文件名（不覆盖旧文件）—— 与现有 save 行为一致 |
 | 网络断开（fetch 失败） | catch → toast "网络错误:<msg>", 状态保留 |
-| 段数 > 100 | sidebar 自动滚动定位，不懒加载 |
+| 段数 > 100 | sidebar 始终渲染所有段（无虚拟滚动/懒加载）；点击段时编辑器光标跳到该段开头 —— 100 段无性能问题故不懒加载 |
 | 文本 > 50KB | parse debounce 改 1000ms（避免大脚本卡） |
 | ~~Safari Cmd+H~~ | **Review 反馈 #5 已删除**，不拦截 |
 | 预览时按保存 | 不允许 —— 切回 edit 模式才能保存 |
-| **主页 AI 生成（script_done via WS）** | **Review 反馈 #6**：/editor 订阅 WebSocket，收到 `script_done` → toast "主页 AI 生成了新脚本「<topic>」，点击加载？"，点 → `?load=` 跳转逻辑 |
+| **主页 AI 生成（script_done via WS）** | **Review 反馈 #6 + MAJOR-6**：/editor 订阅 WebSocket，收到 `script_done` → toast "主页 AI 生成了新脚本「<topic>」，点击加载？"。**点击时若 dirty=true 先 confirm()** "当前编辑未保存，确定加载新脚本？" 再触发 `?load=` 跳转（避免静默覆盖） |
+| **WS 断线** | **Review 反馈 MAJOR-3**：onclose 重连，线性 backoff 1s/2s/4s（最多 3 次），失败后 toast "新脚本通道断开，需手动检查主页" |
+| **Safari 隐私模式 localStorage 抛错** | **Review 反馈 MAJOR-4**：localStorage 读 / 写都 try/catch，失败时静默 fallback 到 in-memory（字号偏好本会话内有效，刷新后回到默认 18px） |
 | 浏览器窄屏（< 900px） | sidebar 自动改为抽屉式，顶部按钮切换显隐（Review 反馈 #7） |
 | 字号 localStorage 持久化 | 关页重开沿用上次值（Review 反馈 #4） |
 | Cmd+S | 拦截浏览器"保存网页" → 调保存按钮（Review 反馈 新增） |
