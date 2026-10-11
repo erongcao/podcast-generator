@@ -186,6 +186,41 @@ function bindEvents() {
 
     // dirty 监听 textarea 值变化的兜底（discard / loadScriptFromUrl 也走 input）
     // F5 已在 loadScriptFromUrl 用 dispatchEvent(new Event('input')) 处理
+
+    // ---- Save ----
+    $('#save-btn')?.addEventListener('click', saveScript);
+
+    // ---- Discard ----
+    $('#discard-btn')?.addEventListener('click', () => {
+        if (!state.dirty) {
+            toast('没有改动', 'info', 1500);
+            return;
+        }
+        if (!confirm('放弃当前修改？')) return;
+        const editor = $('#script-editor');
+        editor.value = state.snapshot;
+        editor.dispatchEvent(new Event('input'));   // F5
+        state.dirty = false;
+        updateTitle();
+        toast('已放弃', 'info');
+    });
+
+    // ---- Cmd+S 拦截 ----
+    document.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+            e.preventDefault();
+            saveScript();
+        }
+    });
+
+    // ---- beforeunload ----
+    window.addEventListener('beforeunload', (e) => {
+        if (state.dirty) {
+            e.preventDefault();
+            e.returnValue = '';
+            return '';
+        }
+    });
 }
 
 let lastSegments = [];   // 缓存给 preview 用
@@ -354,6 +389,53 @@ async function loadPendingScript(toastEl) {
     state.loadedName = null;   // AI 生成不走文件名路径
     updateTitle();
     toast('已加载 AI 生成脚本（记得手动保存）', 'success');
+}
+
+async function saveScript() {
+    const btn = $('#save-btn');
+    if (!state.dirty) {
+        toast('没有改动', 'info', 1500);
+        return;
+    }
+
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '保存中...';
+
+    try {
+        const editor = $('#script-editor');
+        const text = editor.value;
+        // parse 失败也要能存（用户主动存原文）
+        let topic = state.topic;
+        if (lastSegments.length === 0 && text.trim()) {
+            if (!confirm('⚠ 文本 parse 不通过，保存的是原文，确认？')) {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                return;
+            }
+            topic = 'parse失败原文';   // 提示后续看文件名就知道
+        }
+
+        const res = await fetch('/api/scripts/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({script_text: text, topic: topic}),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+
+        state.snapshot = text;
+        state.dirty = false;
+        state.loadedName = data.name;   // MAJOR-5: save 成功后更新
+        updateTitle();
+
+        toast(`✅ 已保存 (${data.name})`, 'success');
+    } catch (e) {
+        toast(`保存失败: ${e.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+    }
 }
 
 // ============================================================
