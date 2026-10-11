@@ -236,19 +236,21 @@ if __name__ == "__main__":
         test_export_impl_rendered_uses_segments,
     ]
     failed = []
-    for t in tests:
-        try:
-            t()
-        except SystemExit:
-            failed.append(t.__name__)
-        except Exception as e:
-            import traceback
-            print(f"❌ EXCEPTION in {t.__name__}: {e}")
-            traceback.print_exc()
-            failed.append(t.__name__)
-
-    # 清理测试创建的 fixture 文件
-    _cleanup_fixtures()
+    try:
+        for t in tests:
+            try:
+                t()
+            except SystemExit:
+                failed.append(t.__name__)
+            except Exception as e:
+                import traceback
+                print(f"❌ EXCEPTION in {t.__name__}: {e}")
+                traceback.print_exc()
+                failed.append(t.__name__)
+    finally:
+        # 清理测试创建的 fixture 文件 — 即使中途异常也跑（try/finally），
+        # 避免污染用户的 ~/Library/Application Support/PodcastGenerator/scripts/
+        _cleanup_fixtures()
 
     print("\n" + "=" * 60)
     if failed:
