@@ -82,11 +82,19 @@ def test_sanitize_filename_strips_unsafe():
     # 4. 半角冒号替换（spec: '<>:"/\\|?*' → '_'，全角冒号不在内）
     _assert(sanitize_filename("a:b") == "a_b",
             "半角冒号替换")
-    # 5. 空 / 纯空白 fallback
-    _assert(sanitize_filename("") == "未命名脚本",
-            "空字符串 → 未命名脚本")
-    _assert(sanitize_filename("   ") == "未命名脚本",
-            "纯空白 → 未命名脚本")
+    # 5. 空 / 纯空白 fallback（ASCII-safe，确保 HTTP header 不被 latin-1 卡掉）
+    _assert(sanitize_filename("") == "untitled_script",
+            "空字符串 → untitled_script")
+    _assert(sanitize_filename("   ") == "untitled_script",
+            "纯空白 → untitled_script")
+    # 6. 末尾的 `_ ._` strip 后空了 → fallback
+    _assert(sanitize_filename("___") == "untitled_script",
+            "全是下划线 → untitled_script")
+    # 7. 中文 / 非 ASCII 透传（不替换，HTTP 层走 RFC 5987 percent-encode）
+    _assert(sanitize_filename("脾硬化") == "脾硬化",
+            "中文文件名保留不变")
+    _assert(sanitize_filename("便秘的成因") == "便秘的成因",
+            "中文长文件名保留不变")
 
 
 # ============================================================
