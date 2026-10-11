@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>脚本编辑器 · Podcast Generator</title>
+    <link rel="stylesheet" href="/static/css/theme.css">
+    <link rel="stylesheet" href="/static/css/editor.css">  <!-- Task 4 创建 -->
+</head>
+<body>
+    <!-- 顶栏 -->
+    <header class="editor-topbar">
+        <div class="topbar-left">
+            <a href="/" class="btn btn-secondary btn-small">← 返回主页</a>
+            <h1 id="editor-title" class="editor-title">未命名脚本</h1>
+            <span id="dirty-indicator" class="dirty-indicator" hidden>✱</span>
+        </div>
+        <div class="topbar-right">
+            <div class="font-controls" role="group" aria-label="字号">
+                <button id="font-decrease-btn" class="btn btn-small" aria-label="减小字号">A−</button>
+                <button id="font-increase-btn" class="btn btn-small" aria-label="增大字号">A+</button>
+                <button id="fullscreen-btn" class="btn btn-small" aria-label="切换全屏">⛶ 全屏</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- 工具栏 -->
+    <div class="editor-toolbar">
+        <div class="toolbar-actions">
+            <button id="save-btn" class="btn btn-primary btn-small">保存</button>
+            <button id="discard-btn" class="btn btn-small">放弃</button>
+            <div class="dropdown">
+                <button id="download-btn" class="btn btn-small">下载md ▾</button>
+                <div id="download-menu" class="dropdown-menu" hidden>
+                    <a href="#" data-format="raw">原文 .md</a>
+                    <a href="#" data-format="rendered">渲染 .md</a>
+                </div>
+            </div>
+            <button id="preview-btn" class="btn btn-small">预览 ◐</button>
+            <select id="recent-scripts-select" class="form-select" aria-label="载入历史脚本">
+                <option>载入历史脚本…</option>
+            </select>
+        </div>
+        <div class="toolbar-stats" id="toolbar-stats">
+            <span id="parse-status">ⓘ 0 段 · 0 字</span>
+        </div>
+    </div>
+
+    <!-- 主区 -->
+    <main class="editor-main">
+        <section class="editor-workspace">
+            <textarea id="script-editor" class="editor-textarea"
+                      spellcheck="false"
+                      placeholder="在此粘贴脚本，或点上方「载入历史脚本」选择…"></textarea>
+            <div id="preview-panel" class="preview-panel" hidden></div>
+        </section>
+
+        <aside class="editor-sidebar" id="editor-sidebar">
+            <div class="sidebar-header">段列表</div>
+            <ol id="segment-list" class="segment-list">
+                <li class="sidebar-empty">暂无段落</li>
+            </ol>
+        </aside>
+    </main>
+
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="/static/js/editor.js"></script>  <!-- Tasks 5-11 创建 -->
+</body>
+</html>
