@@ -7,5 +7,17 @@ urllib3
 sounddevice
 soundfile
 
+# Web dashboard
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+
+# Auth + DB (new in v0.4.0-web)
+sqlalchemy>=2.0
+alembic>=1.13
+bcrypt>=4.1
+itsdangerous>=2.1    # SessionMiddleware signing
+
 # Test deps
 pytest
