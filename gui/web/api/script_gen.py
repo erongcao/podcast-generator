@@ -1,15 +1,20 @@
 """
-script_gen.py — Phase 6 脚本生成路由
+script_gen.py — Phase 6 脚本生成路由（DB-backed, v0.4.0-web Task 3）
 
 3 个入口：
   1. paste  — 直接粘贴（Phase 1 已有，无需后端）
-  2. import — 从 ~/Library/Application Support/PodcastGenerator/scripts/ 历史里挑一个
+  2. import — 从 Script 表里挑一个历史脚本
   3. AI    — MiniMax M3 生成（新功能）
 
 API：
   POST /api/script/generate        MiniMax M3 跑生成
   GET  /api/scripts/recent         列历史脚本（最近 20 个）
-  POST /api/scripts/save           把当前编辑器内容存盘
+  POST /api/scripts/save           把当前编辑器内容存盘（写 DB）
+
+Storage:
+    Primary: scripts table (per-user, owner_id FK)
+    First-run fallback: ~/Library/Application Support/PodcastGenerator/scripts/script_*.json
+                       (auto-imported on first /api/scripts/recent call)
 """
 from __future__ import annotations
 
@@ -18,10 +23,14 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
+from fastapi import HTTPException
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from gui.web.db import SessionLocal
+from gui.web.models import User, Script
 from gui.web.ws import ws_manager
 
 log = logging.getLogger(__name__)
@@ -29,11 +38,88 @@ log = logging.getLogger(__name__)
 # 复用 Phase 5 的凭证 helper
 from gui.web.api.synthesize import _load_minimax_key, _load_volcengine_creds
 
+# Legacy 脚本目录（PySide6 时代的 storage；DB 迁移后只读）
+LEGACY_SCRIPT_DIR = Path.home() / "Library" / "Application Support" / "PodcastGenerator" / "scripts"
+
+# 向后兼容别名：editor.py / tests/test_export.py 仍 import SCRIPT_DIR
+SCRIPT_DIR = LEGACY_SCRIPT_DIR
+
+
 # ============================================================
-# 脚本存档目录（与 PySide6 GUI 共用）
+# Helpers
 # ============================================================
-SCRIPT_DIR = Path.home() / "Library" / "Application Support" / "PodcastGenerator" / "scripts"
-SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+def _get_default_owner(db: Session) -> Optional[User]:
+    """单用户自托管场景下的默认 owner：第一个用户（优先 admin）。"""
+    return (
+        db.query(User)
+        .filter(User.is_admin == True)  # noqa: E712
+        .order_by(User.id)
+        .first()
+        or db.query(User).order_by(User.id).first()
+    )
+
+
+def _save_script_to_db(segments: List[Dict[str, str]], topic: str,
+                       editor_text: str = "") -> dict:
+    """写入 DB scripts 表。Returns dict with 'script_id', 'name', 'saved_to'."""
+    db = SessionLocal()
+    try:
+        owner = _get_default_owner(db)
+        if owner is None:
+            raise RuntimeError(
+                "No user exists. Register a user via /api/auth/register first."
+            )
+
+        ts = datetime.utcnow()
+        editor = editor_text or segments_to_editor_text(segments)
+        script = Script(
+            owner_id=owner.id,
+            topic=topic or "未命名脚本",
+            editor_text=editor,
+            segments_json=json.dumps(segments, ensure_ascii=False) if segments else None,
+            n_segments=sum(1 for s in segments if (s.get("text") or "").strip()),
+            created_at=ts,
+        )
+        db.add(script)
+        db.commit()
+        db.refresh(script)
+        return {
+            "script_id": script.id,
+            "saved_to": f"script_{script.id}",
+            "name": f"script_{script.id}",
+        }
+    finally:
+        db.close()
+
+
+def _format_for_save(
+    segments: List[Dict[str, str]],
+    topic: str,
+    editor_text: str = "",
+) -> str:
+    """
+    [LEGACY] 写入 ~/Library/.../scripts/script_*.json，返回文件路径。
+
+    保留这个 file-system 函数仅为向后兼容：
+      - editor.py 读 SCRIPT_DIR
+      - tests/test_export.py 用它创建 fixture
+    现在 generate_script_thread 走的是 DB 路径（_save_script_to_db）。
+
+    Deprecated: 用 _save_script_to_db。
+    """
+    LEGACY_SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    short = (topic or "未命名主题")[:30].replace("/", "_").replace(" ", "_")
+    name = f"script_{ts}_{short}.json"
+    p = LEGACY_SCRIPT_DIR / name
+    payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "topic": topic,
+        "segments": segments,
+        "editor_text": editor_text or segments_to_editor_text(segments),
+    }
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(p)
 
 
 # ============================================================
@@ -66,12 +152,11 @@ def segments_to_editor_text(segments: List[Dict[str, str]]) -> str:
 
 
 # ============================================================
-# 内部：把 topic / context / custom → chat messages（不复用 MiniMax 的私有函数）
+# 内部：把 topic / context / custom → chat messages
 # ============================================================
 def _build_messages_for_topic(
     topic: str, context: str, custom: str, n_speakers: int, show_name: str,
 ) -> List[Dict[str, str]]:
-    """直接调 minimax_script_gen.build_messages，复用它的 prompt 模板。"""
     from minimax_script_gen import build_messages, DEFAULT_HOSTS_2, DEFAULT_HOSTS_3
     hosts = DEFAULT_HOSTS_2 if n_speakers == 2 else DEFAULT_HOSTS_3
     return build_messages(
@@ -88,15 +173,14 @@ def _build_messages_for_topic(
 # ============================================================
 class ScriptGenRequest(BaseModel):
     topic: str
-    context: str = ""            # 原始素材
-    custom: str = ""             # 附加要求
-    n_speakers: int = 2          # 2 或 3（仅 minimax；豆包硬 2-host 忽略）
-    api_key: str = ""            # 留空 → fallback 到 config.json（仅 minimax）
+    context: str = ""
+    custom: str = ""
+    n_speakers: int = 2
+    api_key: str = ""
     show_name: str = "医学科普播客"
-    # === Phase 6+ 引擎选择 ===
-    engine: str = "minimax"      # "minimax" | "doubao"
-    appid: str = ""              # 豆包用；留空 → config.json / env
-    token: str = ""              # 豆包用；留空 → config.json / env
+    engine: str = "minimax"
+    appid: str = ""
+    token: str = ""
 
 
 class ScriptGenResponse(BaseModel):
@@ -105,26 +189,6 @@ class ScriptGenResponse(BaseModel):
     count: int
     elapsed_sec: float
     saved_to: str = ""
-
-
-def _format_for_save(
-    segments: List[Dict[str, str]],
-    topic: str,
-    editor_text: str = "",
-) -> dict:
-    """存盘到 ~/Library/Application Support/PodcastGenerator/scripts/，文件名带时间戳。"""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    short = (topic or "未命名主题")[:30].replace("/", "_").replace(" ", "_")
-    name = f"script_{ts}_{short}.json"
-    p = SCRIPT_DIR / name
-    payload = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "topic": topic,
-        "segments": segments,
-        "editor_text": editor_text or segments_to_editor_text(segments),
-    }
-    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return str(p)
 
 
 def generate_script_thread(
@@ -138,13 +202,6 @@ def generate_script_thread(
     appid: str = "",
     token: str = "",
 ) -> Optional[ScriptGenResponse]:
-    """
-    引擎分发器。FastAPI 后台线程调起。
-    - engine == "minimax" → MiniMax M3 chat completion
-    - engine == "doubao"  → 豆包 PodcastTTS preview 模式（只要台词，不出音频）
-
-    通过 ws_manager 推 log + progress + script_done/error。
-    """
     if engine == "doubao":
         return _generate_script_thread_doubao(
             topic, context, custom, appid, token, show_name,
@@ -162,8 +219,6 @@ def _generate_script_thread_minimax(
     api_key: str,
     show_name: str,
 ) -> Optional[ScriptGenResponse]:
-    """原 MiniMax M3 chat completion 流程。"""
-    # 1. api_key fallback
     api_key = (api_key or "").strip() or _load_minimax_key()
     if not api_key:
         ws_manager.push({
@@ -193,25 +248,20 @@ def _generate_script_thread_minimax(
         hosts = DEFAULT_HOSTS_2 if n_speakers == 2 else DEFAULT_HOSTS_3
         ws_manager.push({"type": "progress", "done": 2, "total": 4})
 
-        # thinking 模型可能要 1-3 分钟
         ws_manager.push({
             "type": "log", "level": "info",
             "message": "⏳ MiniMax M3 thinking 中（最长 4 分钟）…",
         })
 
-        # 拿到 LLM 原始文本（不经过 minimax_script_gen 的 parse_script），
-        # 因为它的 parse 在多 marker / `---` 块时只取第一个 marker，会丢一半段。
         messages = _build_messages_for_topic(
             topic, context, custom, n_speakers, show_name,
         )
         raw_text = gen._post(messages, max_tokens=None)
 
-        # 用我们自己的 parse（更鲁棒，支持多 marker / `---` 块）重新切段
         from gui.web.api.parse import parse_script_lines
         try:
             segments = parse_script_lines(raw_text)
         except ValueError as e:
-            # LLM 输出格式完全坏了 — 把原文回给用户看
             ws_manager.push({
                 "type": "log", "level": "warning",
                 "message": f"⚠ 解析失败，回退到 minimax_script_gen 自带 parser: {e}",
@@ -225,13 +275,13 @@ def _generate_script_thread_minimax(
 
         ws_manager.push({"type": "progress", "done": 3, "total": 4})
 
-        # 用我们 parse 后的 segments 重新生成 editor_text，确保一致
         script_text = segments_to_editor_text(segments)
-        saved_to = _format_for_save(segments, topic, script_text)
+        save_info = _save_script_to_db(segments, topic, script_text)
+        saved_to = save_info["saved_to"]
         dt = time.time() - t0
         ws_manager.push({
             "type": "log", "level": "success",
-            "message": f"✅ 生成 {len(segments)} 段，耗时 {dt:.1f}s，已存 {Path(saved_to).name}",
+            "message": f"✅ 生成 {len(segments)} 段，耗时 {dt:.1f}s，已存 {save_info['name']}",
         })
         ws_manager.push({"type": "progress", "done": 4, "total": 4})
         ws_manager.push({
@@ -262,33 +312,21 @@ def _generate_script_thread_minimax(
 # 豆包 PodcastTTS 脚本生成（preview 模式，只要台词不要音频）
 # ============================================================
 def _doubao_texts_to_segments(texts: list) -> List[Dict[str, str]]:
-    """
-    把豆包返回 [{speaker: voice_id, text, round_id}, ...] 映射成
-    [{speaker: "主播甲" / "主播乙", text}, ...]。
-
-    规则：
-      1. 过滤 head_music（round_id=-1）和 tail_music（round_id=9999）
-      2. 按出场顺序找 unique speaker → 第 1 个 = 主播甲，第 2 个 = 主播乙
-      3. 第 3+ 个 speaker 静默丢弃（豆包硬 2-host）
-    """
-    # 1. 过滤伪 speaker
     filtered = [
         t for t in texts
         if t.get("round_id") not in (-1, 9999)
         and t.get("speaker") not in ("head_music", "tail_music")
         and (t.get("text") or "").strip()
     ]
-    # 2. 找 unique speaker（保序）
     seen = []
     for t in filtered:
         spk = t.get("speaker", "")
         if spk and spk not in seen:
             seen.append(spk)
     name_map = {}
-    for i, spk in enumerate(seen[:2]):  # 最多 2 个
+    for i, spk in enumerate(seen[:2]):
         name_map[spk] = "主播甲" if i == 0 else "主播乙"
 
-    # 3. 映射
     out = []
     for t in filtered:
         spk = t.get("speaker", "")
@@ -306,10 +344,8 @@ def _generate_script_thread_doubao(
     custom: str,
     appid: str,
     token: str,
-    show_name: str,  # 豆包不接 show_name，留作日志展示
+    show_name: str,
 ) -> Optional[ScriptGenResponse]:
-    """豆包 PodcastTTS：preview 模式，只要 text，不出音频。"""
-    # 1. 凭证 fallback
     if not (appid or "").strip() or not (token or "").strip():
         creds = _load_volcengine_creds()
         appid = (appid or "").strip() or creds["appid"]
@@ -332,7 +368,6 @@ def _generate_script_thread_doubao(
 
     t0 = time.time()
     try:
-        # 拼 input_text：topic + 可选 context + 可选 custom
         text = topic.strip()
         if context.strip():
             text += "\n\n" + context.strip()
@@ -347,7 +382,6 @@ def _generate_script_thread_doubao(
             "message": f"⏳ 连接豆包 WebSocket（input {len(text)} 字，最长 2 分钟）…",
         })
 
-        # 跑豆包（async → sync；用 /tmp 兜个 output_path 因为 only_nlp_text 模式不会写）
         import asyncio
         from doubao_podcast import generate_podcast
         try:
@@ -359,8 +393,6 @@ def _generate_script_thread_doubao(
                 only_nlp_text=True,
             ))
         except RuntimeError as e:
-            # 已有 event loop 的情况（Jupyter/嵌套），退到 run_coroutine_threadsafe 不可行
-            # 这里简单回退：在线程里跑新 loop
             if "asyncio" in str(e) or "loop" in str(e).lower():
                 loop = asyncio.new_event_loop()
                 try:
@@ -378,7 +410,6 @@ def _generate_script_thread_doubao(
 
         ws_manager.push({"type": "progress", "done": 2, "total": 3})
 
-        # 解析成 segments
         texts = result.get("texts", []) or []
         segments = _doubao_texts_to_segments(texts)
         if not segments:
@@ -387,11 +418,12 @@ def _generate_script_thread_doubao(
             )
 
         script_text = segments_to_editor_text(segments)
-        saved_to = _format_for_save(segments, topic, script_text)
+        save_info = _save_script_to_db(segments, topic, script_text)
+        saved_to = save_info["saved_to"]
         dt = time.time() - t0
         ws_manager.push({
             "type": "log", "level": "success",
-            "message": f"✅ 豆包生成 {len(segments)} 段，耗时 {dt:.1f}s，已存 {Path(saved_to).name}",
+            "message": f"✅ 豆包生成 {len(segments)} 段，耗时 {dt:.1f}s，已存 {save_info['name']}",
         })
         ws_manager.push({"type": "progress", "done": 3, "total": 3})
         ws_manager.push({
@@ -419,7 +451,7 @@ def _generate_script_thread_doubao(
 
 
 # ============================================================
-# /api/scripts/recent
+# /api/scripts/recent — DB-backed
 # ============================================================
 class ScriptSummary(BaseModel):
     name: str
@@ -427,41 +459,137 @@ class ScriptSummary(BaseModel):
     created_at: str = ""
     topic: str = ""
     n_segments: int = 0
-    preview: str = ""        # 前 80 字
+    preview: str = ""
+
+
+def _import_legacy_scripts_on_demand(db: Session, owner_id: int) -> List[Script]:
+    """
+    First-run fallback: import script_*.json → scripts table.
+
+    Only runs when scripts table is empty for this owner AND
+    legacy SCRIPT_DIR exists.
+    """
+    if db.query(Script).filter(Script.owner_id == owner_id).count() > 0:
+        return []
+    if not LEGACY_SCRIPT_DIR.exists():
+        return []
+
+    files = sorted(LEGACY_SCRIPT_DIR.glob("script_*.json"))
+    if not files:
+        return []
+
+    rows: List[Script] = []
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        topic = (data.get("topic") or "未命名脚本").strip() or "未命名脚本"
+        segments = data.get("segments") or []
+        editor_text = data.get("editor_text") or ""
+        if not editor_text and segments:
+            editor_text = segments_to_editor_text(segments)
+
+        # 解析 created_at（兼容 +00:00 / Z / naive）
+        ts = datetime.utcnow()
+        if data.get("created_at"):
+            try:
+                s = data["created_at"].replace("Z", "+00:00")
+                ts = datetime.fromisoformat(s)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=None)  # 存 naive，DB 列是 DateTime(timezone=True)
+            except (ValueError, AttributeError):
+                pass
+
+        # Idempotency: same (owner, topic, created_at) tuple
+        existing = (
+            db.query(Script)
+            .filter(
+                Script.owner_id == owner_id,
+                Script.topic == topic,
+                Script.created_at == ts,
+            )
+            .first()
+        )
+        if existing:
+            continue
+
+        s = Script(
+            owner_id=owner_id,
+            topic=topic,
+            editor_text=editor_text,
+            segments_json=json.dumps(segments, ensure_ascii=False) if segments else None,
+            n_segments=sum(1 for x in segments if isinstance(x, dict) and (x.get("text") or "").strip()),
+            created_at=ts,
+        )
+        db.add(s)
+        rows.append(s)
+
+    if rows:
+        try:
+            db.commit()
+            log.info(f"Imported {len(rows)} legacy scripts from {LEGACY_SCRIPT_DIR}")
+        except Exception as e:
+            log.warning(f"Legacy scripts commit failed: {e}")
+            db.rollback()
+            return []
+
+    return rows
+
+
+def _script_row_to_summary(s: Script) -> ScriptSummary:
+    """ORM row → API response. 'path' 字段用 script_{id} 兼容旧前端契约。"""
+    segments: List[dict] = []
+    if s.segments_json:
+        try:
+            segments = json.loads(s.segments_json)
+        except Exception:
+            segments = []
+    preview = ""
+    if segments:
+        first_text = segments[0].get("text", "") if isinstance(segments[0], dict) else ""
+        preview = first_text[:80] + ("..." if len(first_text) > 80 else "")
+    name = f"script_{s.id}"
+    return ScriptSummary(
+        name=name,
+        path=name,           # 兼容旧前端：path.split('/').pop() === name
+        created_at=s.created_at.isoformat() if s.created_at else "",
+        topic=s.topic or "",
+        n_segments=s.n_segments or 0,
+        preview=preview,
+    )
 
 
 def list_recent_scripts(limit: int = 20) -> List[ScriptSummary]:
-    if not SCRIPT_DIR.exists():
-        return []
-    files = sorted(
-        SCRIPT_DIR.glob("script_*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:limit]
-    out = []
-    for p in files:
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        segs = d.get("segments", [])
-        preview = ""
-        if segs:
-            first_text = segs[0].get("text", "")
-            preview = first_text[:80] + ("..." if len(first_text) > 80 else "")
-        out.append(ScriptSummary(
-            name=p.name,
-            path=str(p),
-            created_at=d.get("created_at", ""),
-            topic=d.get("topic", ""),
-            n_segments=len(segs),
-            preview=preview,
-        ))
-    return out
+    """DB-backed. First-run fallback: import legacy JSON files."""
+    db = SessionLocal()
+    try:
+        owner = _get_default_owner(db)
+        if owner is None:
+            return []
+
+        rows = (
+            db.query(Script)
+            .filter(Script.owner_id == owner.id)
+            .order_by(Script.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+        if not rows:
+            # First-run fallback
+            rows = _import_legacy_scripts_on_demand(db, owner.id)
+
+        return [_script_row_to_summary(s) for s in rows]
+    finally:
+        db.close()
 
 
 # ============================================================
-# /api/scripts/save
+# /api/scripts/save — DB write
 # ============================================================
 class ScriptSaveRequest(BaseModel):
     script_text: str
@@ -469,16 +597,93 @@ class ScriptSaveRequest(BaseModel):
 
 
 def save_script_impl(script_text: str, topic: str = "") -> dict:
-    """把当前编辑器内容存盘。返回 {saved_to, name}。"""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    short = (topic or "手动保存")[:30].replace("/", "_").replace(" ", "_")
-    name = f"script_{ts}_{short}.json"
-    p = SCRIPT_DIR / name
-    payload = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "topic": topic or "手动保存",
-        "editor_text": script_text,
-        "source": "manual",
-    }
-    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"saved_to": str(p), "name": name}
+    """把当前编辑器内容存到 DB。返回 {saved_to, name}（兼容旧 API 响应）。"""
+    db = SessionLocal()
+    try:
+        owner = _get_default_owner(db)
+        if owner is None:
+            raise HTTPException(
+                status_code=503,
+                detail="没有可用 owner。请先 /api/auth/register。",
+            )
+
+        ts = datetime.utcnow()
+        script = Script(
+            owner_id=owner.id,
+            topic=(topic or "手动保存").strip() or "手动保存",
+            editor_text=script_text,
+            segments_json=None,  # 用户保存时还没 parse，留空
+            n_segments=0,
+            created_at=ts,
+        )
+        db.add(script)
+        db.commit()
+        db.refresh(script)
+        name = f"script_{script.id}"
+        return {"saved_to": name, "name": name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"保存脚本失败: {e}")
+    finally:
+        db.close()
+
+
+# ============================================================
+# /api/scripts/get — 读单个历史脚本（by name）
+# ============================================================
+def load_script_impl(name: str) -> dict:
+    """
+    读 DB 里单个 script。name 形如 "script_42"。
+
+    向后兼容：旧 JSON 文件（script_YYYYMMDD_HHMMSS_topic.json）若 DB 里没有，
+    尝试从 LEGACY_SCRIPT_DIR 直接读（first-run 过渡期）。
+    """
+    if not name:
+        raise ValueError(f"非法文件名: {name!r}")
+    # 阻止路径穿越
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"文件名含路径分隔符: {name!r}")
+
+    db = SessionLocal()
+    try:
+        owner = _get_default_owner(db)
+
+        # 1. DB lookup by id (primary path)
+        if owner is not None and name.startswith("script_") and not name.endswith(".json"):
+            try:
+                script_id = int(name[len("script_"):])
+                s = (
+                    db.query(Script)
+                    .filter(Script.owner_id == owner.id, Script.id == script_id)
+                    .first()
+                )
+                if s is not None:
+                    segments = []
+                    if s.segments_json:
+                        try:
+                            segments = json.loads(s.segments_json)
+                        except Exception:
+                            segments = []
+                    return {
+                        "created_at": s.created_at.isoformat() if s.created_at else "",
+                        "topic": s.topic,
+                        "editor_text": s.editor_text,
+                        "segments": segments,
+                    }
+            except ValueError:
+                pass  # name 不是纯数字 → fallthrough to legacy
+
+        # 2. Legacy fallback：旧的 script_*.json 文件还在磁盘上
+        if name.startswith("script_") and name.endswith(".json"):
+            legacy_path = LEGACY_SCRIPT_DIR / name
+            if legacy_path.exists():
+                try:
+                    return json.loads(legacy_path.read_text(encoding="utf-8"))
+                except Exception as e:
+                    raise FileNotFoundError(f"{name}: legacy read failed: {e}")
+
+        raise FileNotFoundError(name)
+    finally:
+        db.close()
