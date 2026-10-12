@@ -1,8 +1,9 @@
 # 患者科普播客生成器 · Patient Podcast Generator
 
-> **v0.4.0-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
+> **v0.4.1-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
 > 底层接 3 个 TTS 引擎：**豆包火山**（云端）/ **MiniMax**（云端）/ **VoxCPM2**（本地 Apple Silicon）。
 > 配套 FastAPI Web 看板（替代旧 PySide6 GUI）+ 全屏 `/editor` 脚本编辑器。
+> **v0.4.1 新增**：VoxCPM 段间响度归一化（per-segment loudnorm，-16 LUFS / -1.0 dBTP），jiangyu-4 这类表情 ref 不再忽轻忽响。
 > **v0.4.0 新增**：SQLite + 用户系统（bcrypt + session cookie）+ 遗留 JSON 自动迁移 + 孤儿合成任务修复。
 
 Originally built for a doctor producing patient-education audio content.
@@ -23,6 +24,7 @@ Originally built for a doctor producing patient-education audio content.
 - [架构总览](#架构总览)
 - [HTTP API 速查](#http-api-速查)
 - [测试](#测试)
+- [v0.4.1-web 新增 VoxCPM 段间响度归一化](#v041-web-新增-voxcpm-段间响度归一化)
 - [v0.4.0-web 新增 数据库 + 用户系统](#v040-web-新增数据库--用户系统)
 - [CHANGELOG](#changelog)
 - [故障排查](#故障排查)
@@ -565,6 +567,42 @@ bin/podcast-gui.sh --no-browser   # 关掉自动开
 
 ---
 
+## v0.4.1-web 新增（VoxCPM 段间响度归一化）
+
+v0.4.0 时部分音色（典型如 jiangyu-4 这种"声情并茂"录的 ref）在合成后段间响度不稳——有时很轻，有时很响。MiniMax cloud TTS 因为内部 peak limiter（实测 -1.0 dB / 段间 spread 2.2 dB）听感稳定。v0.4.1-web 让 VoxCPM 走同样的响度规范路径。
+
+### 改动
+
+- **`voxcpm_tts.py`**：恢复 per-segment loudnorm（在 Resemble Enhance 之后、wav→mp3 之前调 `_loudnorm_two_pass`，target=-16 LUFS / -1.0 dBTP / LRA 11）。删除 `synthesize_segments` 末尾的 master loudnorm（段间响度已在段级归一，master 只是无效 post-process）。
+- **`minimax_tts.py`**：补遗 master loudnorm（2026-10-11 漏提交；仅对 mp3 生效）。MiniMax 内部已稳定，master loudnorm 在 minimax 上是 no-op，作为合规安全网。
+
+### 调试与验证
+
+完整调试过程（用户报告 → 排除多版本混淆 → ffmpeg 测段间响度 → 机理分析 → 修复设计 → 实测验证 → 用户听感确认）见 [`docs/2026-10-12-voxcpm-per-seg-loudnorm.md`](docs/2026-10-12-voxcpm-per-seg-loudnorm.md)。
+
+核心数据（3 段故意制造差异的 jiangyu-4 文本）：
+
+| 段 | peak (dBFS) | rms (dBFS) |
+|---|---|---|
+| 短喊叫 | -1.67 | -16.53 |
+| 中等平静 | -1.00 | -15.67 |
+| 长句表情 | -1.21 | -15.40 |
+| **段间 spread** | **0.66 dB** | **1.13 dB** |
+
+- 修复前段间 spread：14.5 dB（用户体验："忽轻忽响"）
+- 修复后段间 spread：0.66 dB（比 MiniMax cloud TTS 的 2.2 dB 还稳）
+- 用户主观听感：✅ "音量不稳定的毛病修好了"
+
+### 错误 reasoning 复盘
+
+之前某次 commit 关掉 per-seg loudnorm 时，留下了这样的注释：
+
+> "短段 < 5s 的 integrated loudness 受内容影响大，每段都压到 -16 LUFS 后段间差 ±3-6 dB"
+
+这是错的。每段都归到 -16 LUFS 后，**段间 LUFS 差按定义 = 0**。混淆了"段内响度大"和"段间响度差"。master loudnorm 解决 podcast-level 听感响度（Apple Podcasts 规范），不解决段间 peak 抖动——后者必须 per-segment 处理。
+
+---
+
 ## v0.4.0-web 新增（数据库 + 用户系统）
 
 v0.3.x 仅在内存里跑（脚本和音色库都是 JSON 文件）。v0.4.0-web 引入了 SQLite + SQLAlchemy 2.x，
@@ -632,6 +670,13 @@ python -m pytest gui/web/tests/  # 跑测试
 
 ## CHANGELOG
 
+### v0.4.1-web (2026-10-12)
+
+- **修复** VoxCPM 段间响度抖动：恢复 per-segment loudnorm（EBU R128, target=-16 LUFS / -1.0 dBTP / LRA 11），删除冗余 master loudnorm。jiangyu-4 这类"声情并茂"ref 段间 peak spread 从 14.5 dB 降到 0.66 dB
+- **修复** MiniMax 路径补遗 master loudnorm（2026-10-11 漏提交；仅 mp3 格式）
+- **文档** 新增 `docs/2026-10-12-voxcpm-per-seg-loudnorm.md`（完整调试 + 修复 + 复盘过程）
+- **测试** 144 个单测全过，零回归
+
 ### v0.4.0-web (2026-10-12)
 
 - 新增 SQLite + SQLAlchemy 2.x + Alembic 数据库
@@ -654,4 +699,4 @@ Personal use. No license specified.
 
 ---
 
-**版本：v0.3.1-web（2026-10-11）· git tag `v0.3.1-web` · commit `22005d6`**
+**版本：v0.4.1-web（2026-10-12）· git tag `v0.4.1-web` · commit 见 `git log`**
