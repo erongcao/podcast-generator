@@ -1,8 +1,9 @@
 # 患者科普播客生成器 · Patient Podcast Generator
 
-> **v0.3.1-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
+> **v0.4.0-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
 > 底层接 3 个 TTS 引擎：**豆包火山**（云端）/ **MiniMax**（云端）/ **VoxCPM2**（本地 Apple Silicon）。
 > 配套 FastAPI Web 看板（替代旧 PySide6 GUI）+ 全屏 `/editor` 脚本编辑器。
+> **v0.4.0 新增**：SQLite + 用户系统（bcrypt + session cookie）+ 遗留 JSON 自动迁移 + 孤儿合成任务修复。
 
 Originally built for a doctor producing patient-education audio content.
 
@@ -22,6 +23,8 @@ Originally built for a doctor producing patient-education audio content.
 - [架构总览](#架构总览)
 - [HTTP API 速查](#http-api-速查)
 - [测试](#测试)
+- [v0.4.0-web 新增 数据库 + 用户系统](#v040-web-新增数据库--用户系统)
+- [CHANGELOG](#changelog)
 - [故障排查](#故障排查)
 - [已知局限](#已知局限)
 - [License](#license)
@@ -559,6 +562,89 @@ bin/podcast-gui.sh --no-browser   # 关掉自动开
 - **AI 生成强依赖 MiniMax M3**：无 key 时 AI 生成按钮不可用，但脚本粘贴 / 导入路径独立可用。
 - **VoxCPM2 限 Apple Silicon + Python 3.10+**：其他平台只能跑云端引擎。
 - **/editor 单文件 6xx 行 — 单视图**：未拆 CodeMirror/Monaco（YAGNI：原生 textarea 够用）
+
+---
+
+## v0.4.0-web 新增（数据库 + 用户系统）
+
+v0.3.x 仅在内存里跑（脚本和音色库都是 JSON 文件）。v0.4.0-web 引入了 SQLite + SQLAlchemy 2.x，
+所有数据持久化到 `~/.podcast-automation/podcast.db`，配套 bcrypt 认证 + cookie 会话。
+
+### 新增能力
+
+- **用户系统**：注册 / 登录 / 退出 / 当前用户（`/api/auth/*`）
+  - 第一个注册的用户自动获得管理员权限（bootstrap）
+  - bcrypt cost=12，session cookie 自动滚动 7 天
+  - 所有认证事件写入 `audit_log` 表（带 IP / UA）
+
+- **数据库表**（8 张）：`User` / `Article` / `Script` / `Synthesis` / `Output` / `VoiceClone` / `ApiKey` / `AuditLog`
+  - 多租户隔离：每个 domain 表都有 `owner_id` 索引
+  - 级联：删除 owner → 删除其 articles + voices + syntheses；删除 article → 保留 script 但清空 article_id
+  - 软删除：`deleted_at` 字段
+  - 迁移用 Alembic：自动生成 + 安全降级
+
+- **遗留 JSON 自动迁移**：运行一次 `python -m gui.web.migrate_legacy`
+  - 从 `~/Library/Application Support/PodcastGenerator/voices/voices.json` 导入音色
+  - 从 `~/Library/Application Support/PodcastGenerator/scripts/script_*.json` 导入脚本
+  - 幂等：可重复运行
+  - 原始 JSON 文件不会被删除（保留作为备份）
+
+- **孤儿自动修复**：进程被 OOM 杀掉时，Synthesis 表可能留 `status="running"` 行。启动时会扫描 `started_at` 超过 1 小时未结束的，标记为 `failed` 配 `error_message="orphaned by process restart"`
+
+### 安全注意事项
+
+- **会话密钥**：默认自动生成并存到 `~/.podcast-automation/session-secret`（mode 0600）。
+  生产环境请通过 `SESSION_SECRET` 环境变量显式注入。
+- **HTTPS**：当前 `https_only=False` 仅适用于本地开发。生产环境需要反向代理（nginx/caddy）
+  + 设 `https_only=True`。
+- **首个管理员**：部署新机器后第一个注册的人 = admin。如果不想这么干，先用
+  `PODCAST_BOOTSTRAP_TOKEN` 启用一次性的注册令牌（v0.5+ 添加）。
+
+### 新增 API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/auth/register` | 注册新用户（首个自动 admin） |
+| `POST` | `/api/auth/login` | 登录（设置 session cookie） |
+| `POST` | `/api/auth/logout` | 退出（清 session） |
+| `GET` | `/api/auth/me` | 获取当前登录用户（401 if not logged in） |
+
+### DB 路径自定义
+
+```bash
+export PODCAST_DATABASE_URL="postgresql://user:pass@host/db"  # 也支持 PG / MySQL
+```
+
+注意：用 Postgres 时 SQLite 才支持的 `check_same_thread=False` 不再需要，但需要单独建 PG 实例 + 修改 DSN。
+
+### 升级到 v0.4.0-web
+
+```bash
+cd ~/Documents/podcast-generator
+git pull
+pip install -r requirements.txt  # 新增 sqlalchemy / alembic / bcrypt / itsdangerous
+alembic upgrade head             # 应用迁移到现有 DB
+python -m gui.web.migrate_legacy # 从 JSON 导入历史数据
+python -m pytest gui/web/tests/  # 跑测试
+```
+
+---
+
+## CHANGELOG
+
+### v0.4.0-web (2026-10-12)
+
+- 新增 SQLite + SQLAlchemy 2.x + Alembic 数据库
+- 新增用户系统：注册 / 登录 / bcrypt + session cookie
+- 新增遗留 JSON 自动迁移（幂等）
+- 新增启动时孤儿合成任务自动修复
+- 新增顶层 audit_log 表 + 4 个事件类型（register / login / login.failed / logout）
+
+### v0.3.1-web (2026-10-10)
+
+- 全屏脚本编辑器 `/editor`
+- 段列表、字号、预览、下载 md
+- 完整 README 重写
 
 ---
 
