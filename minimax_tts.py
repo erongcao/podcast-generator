@@ -44,6 +44,8 @@ from config import CONFIG
 from exceptions import APIError, AudioProcessingError
 from logger import MiniMax
 from network_retry import retry_on_transient
+# 复用 voxcpm_tts 的 master loudnorm（2026-10-11 加；之前 minimax 根本没归一化）
+from voxcpm_tts import _master_loudnorm_mp3
 
 DEFAULT_MODEL = "speech-2.8-hd"
 DEFAULT_SAMPLE_RATE = 32000
@@ -743,6 +745,34 @@ def synthesize_segments(
     # 清理临时分段落文件
     for f in segment_files:
         os.unlink(f)
+
+    # Master loudnorm（2026-10-11 新增；minimax 之前根本没有任何归一化）
+    # -16 LUFS / -1.0 dBTP / LRA 11 是 Apple Podcasts 规范；
+    # loudnorm 仅安全用于 mp3，其他格式（wav/flac/opus）跳过避免破坏 raw 数据。
+    if ext == "mp3":
+        try:
+            import time as _time, tempfile as _tempfile, shutil as _shutil
+            _t0 = _time.time()
+            _log(f"开始 master loudnorm（minimax {len(segment_files)} 段）…")
+            with _tempfile.NamedTemporaryFile(
+                prefix="minimax_master_", suffix=".mp3",
+                delete=False, dir="output",
+            ) as _tf:
+                _concat_tmp = _tf.name
+            _shutil.copy2(combined, _concat_tmp)
+            stats = _master_loudnorm_mp3(_concat_tmp, combined)
+            os.unlink(_concat_tmp)
+            dt = _time.time() - _t0
+            in_lufs = stats.get("input_lufs")
+            out_lufs = stats.get("output_lufs", stats.get("target_lufs"))
+            _log(
+                f"✅ master loudnorm 完成 {dt:.1f}s: "
+                f"input {in_lufs:+.1f} LUFS → output {out_lufs:+.1f} LUFS "
+                f"(target -16.0)"
+            )
+        except Exception as e:
+            _log(f"⚠ master loudnorm 失败，用 raw concat 输出: {e}")
+            # 不阻塞主流程
 
     order_desc = " -> ".join([f"{s}({v})" for _, s, v in segment_order])
     return combined, order_desc
