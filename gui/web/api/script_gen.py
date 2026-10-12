@@ -29,8 +29,9 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from gui.web.auth import get_default_owner
 from gui.web.db import SessionLocal
-from gui.web.models import User, Script
+from gui.web.models import Script, utcnow
 from gui.web.ws import ws_manager
 
 log = logging.getLogger(__name__)
@@ -41,36 +42,24 @@ from gui.web.api.synthesize import _load_minimax_key, _load_volcengine_creds
 # Legacy 脚本目录（PySide6 时代的 storage；DB 迁移后只读）
 LEGACY_SCRIPT_DIR = Path.home() / "Library" / "Application Support" / "PodcastGenerator" / "scripts"
 
-# 向后兼容别名：editor.py / tests/test_export.py 仍 import SCRIPT_DIR
+# 向后兼容别名：editor.py / tests/test_export.py 仍 import SCRIPT_DIR。
+# Deprecated alias for LEGACY_SCRIPT_DIR. Remove after 2026-12-01 — by then,
+# editor.py and tests/test_export.py should read from DB directly.
+# Tracked in: docs/migrations/deprecation-log.md (TODO if not existing)
 SCRIPT_DIR = LEGACY_SCRIPT_DIR
 
 
 # ============================================================
 # Helpers
 # ============================================================
-def _get_default_owner(db: Session) -> Optional[User]:
-    """单用户自托管场景下的默认 owner：第一个用户（优先 admin）。"""
-    return (
-        db.query(User)
-        .filter(User.is_admin == True)  # noqa: E712
-        .order_by(User.id)
-        .first()
-        or db.query(User).order_by(User.id).first()
-    )
-
-
 def _save_script_to_db(segments: List[Dict[str, str]], topic: str,
                        editor_text: str = "") -> dict:
     """写入 DB scripts 表。Returns dict with 'script_id', 'name', 'saved_to'."""
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
-            raise RuntimeError(
-                "No user exists. Register a user via /api/auth/register first."
-            )
+        owner = get_default_owner(db)  # raises if no users
 
-        ts = datetime.utcnow()
+        ts = utcnow()
         editor = editor_text or segments_to_editor_text(segments)
         script = Script(
             owner_id=owner.id,
@@ -105,8 +94,14 @@ def _format_for_save(
       - tests/test_export.py 用它创建 fixture
     现在 generate_script_thread 走的是 DB 路径（_save_script_to_db）。
 
-    Deprecated: 用 _save_script_to_db。
+    DEPRECATED 2026-10-12 — use Script ORM model directly via _save_script_to_db.
     """
+    import warnings
+    warnings.warn(
+        "_format_for_save is deprecated, use Script ORM model directly",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     LEGACY_SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     short = (topic or "未命名主题")[:30].replace("/", "_").replace(" ", "_")
@@ -468,6 +463,11 @@ def _import_legacy_scripts_on_demand(db: Session, owner_id: int) -> List[Script]
 
     Only runs when scripts table is empty for this owner AND
     legacy SCRIPT_DIR exists.
+
+    Dedup: keyed on (owner_id, original_filename=stem) — guarantees
+    uniqueness because file stem is unique on disk. (topic, created_at)
+    was the old dedup tuple but could collide if two legacy files happen
+    to share metadata.
     """
     if db.query(Script).filter(Script.owner_id == owner_id).count() > 0:
         return []
@@ -494,7 +494,7 @@ def _import_legacy_scripts_on_demand(db: Session, owner_id: int) -> List[Script]
             editor_text = segments_to_editor_text(segments)
 
         # 解析 created_at（兼容 +00:00 / Z / naive）
-        ts = datetime.utcnow()
+        ts = utcnow()
         if data.get("created_at"):
             try:
                 s = data["created_at"].replace("Z", "+00:00")
@@ -504,13 +504,14 @@ def _import_legacy_scripts_on_demand(db: Session, owner_id: int) -> List[Script]
             except (ValueError, AttributeError):
                 pass
 
-        # Idempotency: same (owner, topic, created_at) tuple
+        # Idempotency: same (owner, original_filename) — filename stem is
+        # guaranteed unique within LEGACY_SCRIPT_DIR.
+        original_filename = path.stem
         existing = (
             db.query(Script)
             .filter(
                 Script.owner_id == owner_id,
-                Script.topic == topic,
-                Script.created_at == ts,
+                Script.original_filename == original_filename,
             )
             .first()
         )
@@ -523,6 +524,7 @@ def _import_legacy_scripts_on_demand(db: Session, owner_id: int) -> List[Script]
             editor_text=editor_text,
             segments_json=json.dumps(segments, ensure_ascii=False) if segments else None,
             n_segments=sum(1 for x in segments if isinstance(x, dict) and (x.get("text") or "").strip()),
+            original_filename=original_filename,
             created_at=ts,
         )
         db.add(s)
@@ -567,8 +569,9 @@ def list_recent_scripts(limit: int = 20) -> List[ScriptSummary]:
     """DB-backed. First-run fallback: import legacy JSON files."""
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError:
             return []
 
         rows = (
@@ -600,14 +603,15 @@ def save_script_impl(script_text: str, topic: str = "") -> dict:
     """把当前编辑器内容存到 DB。返回 {saved_to, name}（兼容旧 API 响应）。"""
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError as e:
             raise HTTPException(
                 status_code=503,
-                detail="没有可用 owner。请先 /api/auth/register。",
+                detail=f"没有可用 owner: {e}",
             )
 
-        ts = datetime.utcnow()
+        ts = utcnow()
         script = Script(
             owner_id=owner.id,
             topic=(topic or "手动保存").strip() or "手动保存",
@@ -648,7 +652,10 @@ def load_script_impl(name: str) -> dict:
 
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError:
+            owner = None
 
         # 1. DB lookup by id (primary path)
         if owner is not None and name.startswith("script_") and not name.endswith(".json"):

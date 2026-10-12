@@ -17,37 +17,27 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
+from gui.web.auth import get_default_owner
 from gui.web.db import SessionLocal
-from gui.web.models import User, Script, Synthesis, Output
+from gui.web.models import Script, Synthesis, Output, utcnow
 from gui.web.ws import ws_manager
 
 log = logging.getLogger(__name__)
+
+# Truncation for the error_message DB column (Text type, but we cap at 2KB
+# to keep /api/synthesize/* responses light). Full traceback lives in
+# ws_manager logs and the synthesis row itself.
+ERROR_MESSAGE_MAX = 2000
 
 
 # ============================================================
 # DB tracking helpers (Task 3)
 # ============================================================
-def _get_default_owner(db) -> Optional[User]:
-    """单用户自托管场景下的默认 owner：第一个用户（优先 admin）。
-
-    Returns None if no users exist. Callers must handle None gracefully
-    (skip DB writes, still run synthesis).
-    """
-    return (
-        db.query(User)
-        .filter(User.is_admin == True)  # noqa: E712
-        .order_by(User.id)
-        .first()
-        or db.query(User).order_by(User.id).first()
-    )
-
-
 def _create_synthesis(
     segments: List[Dict[str, str]],
     voice_map: Dict[str, str],
@@ -64,12 +54,13 @@ def _create_synthesis(
     """
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
-            log.warning("No user exists; synthesis DB tracking skipped")
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError as e:
+            log.warning(f"No user exists; synthesis DB tracking skipped: {e}")
             return None
 
-        ts = datetime.utcnow()
+        ts = utcnow()
         scratch_topic = f"web_{engine}_{ts.strftime('%Y%m%d_%H%M%S')}_{len(segments)}seg"
         n_text = sum(1 for s in segments if (s.get("text") or "").strip())
         script = Script(
@@ -116,7 +107,7 @@ def _complete_synthesis(synth: Optional[Synthesis], output_path: str) -> None:
         if synth_db is None:
             return
         synth_db.status = "done"
-        synth_db.finished_at = datetime.utcnow()
+        synth_db.finished_at = utcnow()
 
         # Output row
         p = Path(output_path)
@@ -127,7 +118,7 @@ def _complete_synthesis(synth: Optional[Synthesis], output_path: str) -> None:
             file_path=str(p),
             file_size=file_size,
             format=p.suffix.lstrip(".") or "mp3",
-            created_at=datetime.utcnow(),
+            created_at=utcnow(),
         )
         db.add(out)
         db.commit()
@@ -148,8 +139,8 @@ def _fail_synthesis(synth: Optional[Synthesis], error_message: str) -> None:
         if synth_db is None:
             return
         synth_db.status = "failed"
-        synth_db.finished_at = datetime.utcnow()
-        synth_db.error_message = error_message[:2000]  # truncate
+        synth_db.finished_at = utcnow()
+        synth_db.error_message = (error_message or "")[:ERROR_MESSAGE_MAX]
         db.commit()
     except Exception as e:
         log.warning(f"Failed to record synthesis failure: {e}")
@@ -286,7 +277,8 @@ def build_output_path() -> str:
 import json as _json
 import os as _os
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "config.json"
+from gui.web.paths import ROOT_DIR
+CONFIG_PATH = ROOT_DIR / "config.json"
 
 
 def _load_minimax_key() -> str:

@@ -15,6 +15,7 @@ Podcast Generator — Web 看板 (FastAPI 后端)
 """
 from __future__ import annotations
 
+import logging
 import sys
 import time
 import webbrowser
@@ -34,6 +35,7 @@ from pydantic import BaseModel  # noqa: E402
 
 from gui.web.ws import ws_manager  # noqa: E402
 from gui.web.auth import SESSION_SECRET, SESSION_MAX_AGE  # noqa: E402
+from gui.web.paths import STATIC_DIR  # noqa: E402
 from gui.web.api.auth import router as auth_router  # noqa: E402
 from gui.web.api.synthesize import (  # noqa: E402
     SynthesizeRequest,
@@ -65,9 +67,49 @@ from gui.web.api.script_gen import (  # noqa: E402
 )
 from gui.web.api.editor import export_impl  # noqa: E402
 
-STATIC_DIR = Path(__file__).parent / "static"
 HOST = "127.0.0.1"
 PORT = 8765
+
+log = logging.getLogger(__name__)
+
+
+def _reconcile_orphaned_syntheses() -> None:
+    """Mark any Synthesis rows stuck in 'running' as failed at server boot.
+
+    If the process is killed mid-synthesis (OOM, SIGKILL, hard crash),
+    Synthesis rows stay 'status=running' forever with no finished_at —
+    there's no watchdog to clean them up. This hook runs ONCE at startup
+    and reconciles any row whose started_at is > 1h ago (forgiving enough
+    that legitimately-running syntheses aren't disturbed).
+
+    Error message: 'orphaned by process restart' — operators can grep for it.
+    """
+    from datetime import datetime, timezone, timedelta
+    from gui.web.db import SessionLocal
+    from gui.web.models import Synthesis
+
+    db = SessionLocal()
+    try:
+        threshold = datetime.now(timezone.utc) - timedelta(hours=1)
+        orphaned = (
+            db.query(Synthesis)
+            .filter(Synthesis.status == "running", Synthesis.started_at < threshold)
+            .all()
+        )
+        now = datetime.now(timezone.utc)
+        for s in orphaned:
+            s.status = "failed"
+            s.finished_at = now
+            s.error_message = "orphaned by process restart"
+            log.warning("Marked synthesis %s as failed (orphan)", s.id)
+        if orphaned:
+            db.commit()
+            log.info(f"Reconciled {len(orphaned)} orphaned synthesis rows")
+    except Exception as e:
+        log.warning(f"Orphan reconciler failed: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 app = FastAPI(
     title="Podcast Generator",
@@ -113,6 +155,9 @@ app.include_router(auth_router)
 async def on_startup():
     import asyncio
     ws_manager.set_loop(asyncio.get_running_loop())
+
+    # 启动时清理 orphan synthesis rows（被 kill mid-synthesis 留下的"running"残骸）
+    _reconcile_orphaned_syntheses()
 
     # 信号兜底：捕获 SIGTERM / SIGINT（uvicorn 转发的硬杀信号），写 log 留死机痕迹。
     # 必须在 startup 注册；on_shutdown 才注册就晚了（uvicorn 已经在 graceful shutdown）。

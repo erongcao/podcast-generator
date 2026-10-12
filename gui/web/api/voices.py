@@ -22,7 +22,6 @@ import logging
 import re
 import shutil
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -31,8 +30,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from gui.web.auth import get_default_owner
 from gui.web.db import SessionLocal
-from gui.web.models import User, VoiceClone
+from gui.web.models import VoiceClone, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -45,20 +45,25 @@ LEGACY_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
 # Helpers
 # ============================================================
-def _get_default_owner(db: Session) -> Optional[User]:
-    """
-    单用户自托管场景下的默认 owner：第一个用户（优先 admin）。
+def _safe_resolve_audio_path(p: Path) -> Optional[Path]:
+    """Defense-in-depth: audio files must live under LEGACY_AUDIO_DIR.
 
-    Returns None if no users. Callers must handle None gracefully
-    (return empty list rather than 500).
+    Returns the resolved Path if it stays inside LEGACY_AUDIO_DIR,
+    otherwise None (caller returns 404). This guards against
+    malformed DB rows whose audio_path was set to /etc/passwd or similar.
     """
-    return (
-        db.query(User)
-        .filter(User.is_admin == True)  # noqa: E712
-        .order_by(User.id)
-        .first()
-        or db.query(User).order_by(User.id).first()
-    )
+    try:
+        # resolve() also follows symlinks; compare to base dir
+        resolved = p.resolve()
+        base = LEGACY_AUDIO_DIR.resolve()
+        if not resolved.is_relative_to(base):
+            log.warning(
+                f"audio_path {p} resolves to {resolved} outside LEGACY_AUDIO_DIR {base}"
+            )
+            return None
+        return resolved if resolved.exists() else None
+    except (OSError, ValueError):
+        return None
 
 
 def _to_summary(v: VoiceClone) -> "VoiceSummary":
@@ -200,8 +205,9 @@ def list_voices_impl() -> VoiceListResponse:
     """
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError:
             return VoiceListResponse(voices=[], total=0)
 
         rows = (
@@ -230,8 +236,9 @@ def _find_audio_path(vid: str) -> Optional[Path]:
     """优先 audio_path（mp3/wav 直接 stream）。"""
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError:
             return None
         v = (
             db.query(VoiceClone)
@@ -241,7 +248,7 @@ def _find_audio_path(vid: str) -> Optional[Path]:
         if v is None or not v.audio_path:
             return None
         p = Path(v.audio_path)
-        return p if p.exists() else None
+        return _safe_resolve_audio_path(p)
     finally:
         db.close()
 
@@ -269,8 +276,9 @@ class DeleteResponse(BaseModel):
 def delete_voice_impl(vid: str) -> DeleteResponse:
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError:
             raise HTTPException(status_code=404, detail=f"voice_id 不存在: {vid}")
 
         v = (
@@ -355,8 +363,9 @@ def add_voice_impl(
     # 3. 写 DB
     db = SessionLocal()
     try:
-        owner = _get_default_owner(db)
-        if owner is None:
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError:
             # 没有 owner：回滚文件
             dest.unlink(missing_ok=True)
             raise HTTPException(
@@ -382,7 +391,7 @@ def add_voice_impl(
             notes=notes or None,
             tags=list(tags or []),
             audio_path=str(dest),
-            created_at=datetime.utcnow(),
+            created_at=utcnow(),
         )
         db.add(v)
         db.commit()

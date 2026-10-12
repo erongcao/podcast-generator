@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from gui.web.auth import get_default_owner
 from gui.web.db import SessionLocal, init_db
 from gui.web.models import User, VoiceClone, Script
 
@@ -50,26 +51,19 @@ def _parse_dt(s: str | None) -> Optional[datetime]:
 def _get_or_bootstrap_owner(db) -> User:
     """
     Find the legacy owner. Order:
-      1. First admin user (created at register/login time)
-      2. First user by id
-      3. Bootstrap: create a 'legacy_owner' admin user (no password —
+      1. auth.get_default_owner (admin first, then first user)
+      2. Bootstrap: create a 'legacy_owner' admin user (no password —
          meant for first-run DB seeding; user can later create real
          accounts via /api/auth/register).
 
     Returns: User instance (already in session).
     """
-    owner = (
-        db.query(User)
-        .filter(User.is_admin == True)  # noqa: E712
-        .order_by(User.id)
-        .first()
-    )
-    if owner:
-        return owner
-    owner = db.query(User).order_by(User.id).first()
-    if owner:
-        return owner
-    # Bootstrap
+    try:
+        return get_default_owner(db)
+    except RuntimeError:
+        pass
+
+    # Bootstrap path — first run with empty DB
     log.warning("⚠  No users in DB. Bootstrapping legacy_owner account.")
     log.warning("   Register a real user via /api/auth/register and re-run.")
     owner = User(
@@ -168,8 +162,13 @@ def migrate_scripts(db, owner: User) -> int:
     Import scripts/*.json → scripts. Returns number of new rows imported.
 
     Idempotency:
-      - Per-file: skip if same (owner, topic, created_at) tuple already exists
-        (handles the rare case where someone re-ran after partial import)
+      - Per-file: skip if same (owner, original_filename=stem) already
+        imported (handles re-runs / partial imports).
+      - original_filename is the file stem (e.g. "script_20261011_145102_topic")
+        which is guaranteed unique within LEGACY_SCRIPTS_DIR.
+      - Old dedup tuple was (owner, topic, created_at) which could collide
+        if two legacy files happened to share metadata; original_filename
+        is more reliable.
     """
     if not LEGACY_SCRIPTS_DIR.exists():
         log.info(f"  ⏭  scripts dir not found: {LEGACY_SCRIPTS_DIR}")
@@ -215,13 +214,13 @@ def migrate_scripts(db, owner: User) -> int:
 
         created_at = _parse_dt(data.get("created_at")) or datetime.now()
 
-        # Idempotency: same topic + same second → already imported
+        # Idempotency: original_filename (file stem) is unique on disk.
+        original_filename = path.stem
         existing = (
             db.query(Script)
             .filter(
                 Script.owner_id == owner.id,
-                Script.topic == topic,
-                Script.created_at == created_at,
+                Script.original_filename == original_filename,
             )
             .first()
         )
@@ -235,6 +234,7 @@ def migrate_scripts(db, owner: User) -> int:
             editor_text=editor_text,
             segments_json=json.dumps(segments, ensure_ascii=False) if segments else None,
             n_segments=sum(1 for s in segments if isinstance(s, dict) and (s.get("text") or "").strip()),
+            original_filename=original_filename,
             created_at=created_at,
         )
         db.add(script)

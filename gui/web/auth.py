@@ -23,16 +23,15 @@ from __future__ import annotations
 import json
 import os
 import secrets as _secrets
-from pathlib import Path
 from typing import Optional
 import bcrypt
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from gui.web.db import get_db
 from gui.web.models import User
+from gui.web.paths import SESSION_SECRET_FILE
 
 
-SESSION_SECRET_FILE = Path.home() / ".podcast-automation" / "session-secret"
 SESSION_MAX_AGE = 7 * 24 * 60 * 60  # 7 days
 BCRYPT_ROUNDS = 12  # NIST-style guidance: ≥ 12 for interactive auth
 
@@ -96,6 +95,37 @@ def get_current_user_optional(
     if not user or not user.is_active:
         return None
     return user
+
+
+def get_default_owner(db: Session) -> User:
+    """
+    Find a sensible default owner for legacy migration paths (single-user
+    self-hosted deployment where most calls don't carry auth context).
+
+    Order:
+      1. First admin user
+      2. First user (by id)
+      3. Raises RuntimeError if no users exist (run `python -m
+         gui.web.migrate_legacy` first to bootstrap legacy_owner)
+
+    Single source of truth — replaces 3 duplicated copies in api/voices.py,
+    api/script_gen.py, api/synthesize.py.
+    """
+    admin = (
+        db.query(User)
+        .filter(User.is_admin == True)  # noqa: E712
+        .order_by(User.id)
+        .first()
+    )
+    if admin:
+        return admin
+    any_user = db.query(User).order_by(User.id).first()
+    if any_user:
+        return any_user
+    raise RuntimeError(
+        "No users in DB. Run `python -m gui.web.migrate_legacy` first "
+        "to bootstrap a legacy_owner account."
+    )
 
 
 def get_current_user(

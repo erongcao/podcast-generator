@@ -70,6 +70,10 @@ class Script(Base):
     n_segments: Mapped[int] = mapped_column(Integer, default=0)
     visibility: Mapped[str] = mapped_column(String(16), default="private")  # private | unlisted | public
     share_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
+    # original_filename: 兼容 PySide6 时代 import 进来的脚本（原 filename stem），
+    # 让 dedup 基于"文件名唯一"而非"(topic, created_at) 可能撞车"的 tuple。
+    # 仅 legacy import 路径会填，新建的脚本为 None。
+    original_filename: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     deleted_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
