@@ -2,18 +2,28 @@
 auth.py — bcrypt + session + dependency injection
 
 Layered:
-    SessionMiddleware (signed cookie, secret from SESSION_SECRET env or default)
-    → request.session['user_id'] = int
+    SessionMiddleware (signed cookie, secret from SESSION_SECRET env or
+    auto-generated file) → request.session['user_id'] = int
     → get_current_user() reads it
 
-Session secret:
-    default = "dev-insecure-CHANGE-IN-PROD" (overridable via SESSION_SECRET env var)
-    Max age  = 7 days
+Session secret strategy:
+    Priority order:
+    1. SESSION_SECRET env var (explicit, for prod)
+    2. ~/.podcast-automation/session-secret file (auto-generated on first run)
+    3. Auto-generate, write to file with 0o600 perms, return
+
+    Never fall back to a hard-coded default — that would let attackers
+    forge admin cookies. The dev fallback that previously existed has
+    been removed.
+
+Max age = 7 days
 """
 from __future__ import annotations
 
-import os
 import json
+import os
+import secrets as _secrets
+from pathlib import Path
 from typing import Optional
 import bcrypt
 from fastapi import Depends, HTTPException, Request, status
@@ -22,16 +32,47 @@ from gui.web.db import get_db
 from gui.web.models import User
 
 
-SESSION_SECRET = os.environ.get(
-    "SESSION_SECRET",
-    "dev-insecure-CHANGE-IN-PROD"
-)
+SESSION_SECRET_FILE = Path.home() / ".podcast-automation" / "session-secret"
 SESSION_MAX_AGE = 7 * 24 * 60 * 60  # 7 days
+BCRYPT_ROUNDS = 12  # NIST-style guidance: ≥ 12 for interactive auth
+
+
+def _resolve_session_secret() -> str:
+    """Resolve session signing secret.
+
+    Order:
+      1. SESSION_SECRET env var
+      2. Read from SESSION_SECRET_FILE (auto-generated on first run)
+      3. Auto-generate, write to file (0o600), return
+
+    Never falls back to a hard-coded value — that would let attackers
+    forge admin cookies for any user_id.
+    """
+    env_secret = os.environ.get("SESSION_SECRET")
+    if env_secret:
+        return env_secret
+
+    # Try to read existing file
+    if SESSION_SECRET_FILE.exists():
+        stored = SESSION_SECRET_FILE.read_text().strip()
+        if stored and len(stored) >= 32:
+            return stored
+        # File is corrupted/empty — fall through to regenerate
+
+    # Generate and persist
+    SESSION_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    new_secret = _secrets.token_urlsafe(48)  # 384 bits of entropy
+    SESSION_SECRET_FILE.write_text(new_secret)
+    SESSION_SECRET_FILE.chmod(0o600)  # owner-only
+    return new_secret
+
+
+SESSION_SECRET = _resolve_session_secret()
 
 
 def hash_password(plain: str) -> str:
-    """bcrypt hash. Cost=12 default."""
-    salt = bcrypt.gensalt(rounds=12)
+    """bcrypt hash. Cost=BCRYPT_ROUNDS (default 12)."""
+    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
     return bcrypt.hashpw(plain.encode("utf-8"), salt).decode("utf-8")
 
 
