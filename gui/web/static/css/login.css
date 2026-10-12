@@ -1,0 +1,137 @@
+/* login.css — 登录/注册页样式
+ *
+ * 复用 theme.css 变量：
+ *   --color-cream      背景
+ *   --color-white      卡片背景
+ *   --color-dust       边框
+ *   --color-text       主文字
+ *   --color-text-light 次文字
+ *   --color-totoro     强调色（按钮 hover）
+ *   --color-error      错误提示
+ */
+
+body {
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    background: var(--color-cream);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.login-container {
+    width: 100%;
+    max-width: 400px;
+    background: var(--color-white);
+    padding: 32px 28px;
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
+    border: 1px solid var(--color-dust);
+}
+
+.login-title {
+    margin: 0 0 6px;
+    font-size: 22px;
+    text-align: center;
+    color: var(--color-text);
+}
+
+.login-subtitle {
+    margin: 0 0 24px;
+    font-size: 14px;
+    text-align: center;
+    color: var(--color-text-light);
+}
+
+.login-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--color-dust);
+    margin-bottom: 20px;
+}
+
+.tab-btn {
+    flex: 1;
+    padding: 10px;
+    border: none;
+    background: none;
+    font-size: 14px;
+    color: var(--color-text-light);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+}
+
+.tab-btn.active {
+    color: var(--color-text);
+    border-bottom-color: var(--color-totoro);
+    font-weight: 500;
+}
+
+.login-form {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.login-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--color-text);
+}
+
+.login-form label em {
+    color: var(--color-text-light);
+    font-style: normal;
+    font-size: 11px;
+}
+
+.login-form input {
+    padding: 10px 12px;
+    border: 1px solid var(--color-dust);
+    border-radius: 6px;
+    font-size: 14px;
+    background: var(--color-cream);
+    color: var(--color-text);
+}
+
+.login-form input:focus-visible {
+    outline: none;
+    border-color: var(--color-totoro);
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.05);
+}
+
+.btn-block {
+    width: 100%;
+    padding: 12px;
+    margin-top: 6px;
+}
+
+.login-error {
+    margin: 0;
+    padding: 8px 12px;
+    background: rgba(255, 0, 0, 0.05);
+    color: var(--color-error);
+    border: 1px solid var(--color-error);
+    border-radius: 6px;
+    font-size: 13px;
+}
+
+.login-foot {
+    margin: 20px 0 0;
+    text-align: center;
+    font-size: 12px;
+}
+
+.login-foot a {
+    color: var(--color-text-light);
+    text-decoration: none;
+}
+
+.login-foot a:hover {
+    color: var(--color-totoro);
+}

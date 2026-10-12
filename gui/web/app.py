@@ -29,9 +29,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
+from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 from gui.web.ws import ws_manager  # noqa: E402
+from gui.web.auth import SESSION_SECRET, SESSION_MAX_AGE  # noqa: E402
+from gui.web.api.auth import router as auth_router  # noqa: E402
 from gui.web.api.synthesize import (  # noqa: E402
     SynthesizeRequest,
     SynthesizeStartResponse,
@@ -72,6 +75,17 @@ app = FastAPI(
     description="本地播客生成工具 — Web 看板版（替代 PySide6）",
 )
 
+# SessionMiddleware (signed cookie) — must be added BEFORE any @app.on_event hooks
+# so Starlette applies it on every request (middleware order is LIFO, but
+# add_middleware at startup is the conventional place).
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    max_age=SESSION_MAX_AGE,
+    same_site="lax",
+    https_only=False,  # localhost dev OK; flip to True behind reverse proxy
+)
+
 # 静态资源（CSS / JS / 图片）
 app.mount(
     "/static",
@@ -87,6 +101,9 @@ app.mount(
     StaticFiles(directory=str(OUTPUT_DIR)),
     name="output",
 )
+
+# Auth API (register / login / logout / me)
+app.include_router(auth_router)
 
 
 # ============================================================
@@ -504,6 +521,12 @@ async def api_scripts_export(name: str, format: str = "raw"):
 async def editor_index():
     """全屏脚本编辑器页面（静态 HTML）。"""
     return FileResponse(str(STATIC_DIR / "editor.html"))
+
+
+@app.get("/login")
+async def login_page():
+    """登录页（静态 HTML）。"""
+    return FileResponse(str(STATIC_DIR / "login.html"))
 
 
 # ============================================================
