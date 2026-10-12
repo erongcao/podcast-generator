@@ -110,6 +110,10 @@ def _loudnorm_two_pass(
 
     实测：4 voice 输入下输出 LUFS 极差从 ±1.6 LU（单遍）压到 ±1.0 LU（两遍）。
     短段（<5s）linear 模式也受 TP limiter 影响，±0.5 LU 是 ffmpeg 上限。
+
+    注意：此函数用于 per-seg 路径（已废弃）；master 路径请用 _master_loudnorm_mp3。
+    原因：per-seg 短段（<5s）的 integrated loudness 受单段内容影响大，
+    1 段"啊！"被压到 -16 LUFS，与 10 秒平静句同响度，听感"忽轻忽响"。
     """
     import json
 
@@ -163,6 +167,96 @@ def _loudnorm_two_pass(
         raise AudioProcessingError(
             f"loudnorm pass2 失败: {p2.stderr[-300:]}"
         )
+
+
+def _master_loudnorm_mp3(
+    mp3_in: str,
+    mp3_out: str,
+    target_lufs: float = -16.0,
+    target_tp: float = -1.0,
+    target_lra: float = 11.0,
+) -> dict:
+    """
+    整 podcast master loudnorm → MP3 320k / 48kHz / mono。
+
+    替代 per-segment loudnorm（2026-10-11 改）：
+    per-seg 短段 < 5s 的 integrated loudness 受单段内容影响极大（短喊叫 vs 长平静），
+    每段都压到 -16 LUFS 后段间差 ±3-6 dB，听感"忽轻忽响"。
+    master 走整 podcast integrated window（典型 30s+），±1 LU 命中，
+    段间相对响度由人声天然强弱决定，**听感更自然**。
+
+    Returns: dict with measured input/output LUFS / TP（用于日志/调试）
+    """
+    import json
+
+    if not shutil.which("ffmpeg"):
+        raise AudioProcessingError("ffmpeg 未找到，无法 loudnorm")
+
+    # Pass 1：测量整 podcast integrated loudness
+    p1 = subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "info",
+            "-i", str(mp3_in),
+            "-af",
+            f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
+            f":print_format=json",
+            "-f", "null", "-",
+        ],
+        capture_output=True, text=True, timeout=180,
+    )
+    jstart = p1.stderr.rfind("{")
+    jend = p1.stderr.rfind("}") + 1
+    if jstart < 0 or jend <= jstart:
+        raise AudioProcessingError(
+            f"master loudnorm pass1 没产出 stats: stderr={p1.stderr[-300:]}"
+        )
+    try:
+        stats = json.loads(p1.stderr[jstart:jend])
+    except json.JSONDecodeError as e:
+        raise AudioProcessingError(
+            f"master loudnorm pass1 JSON 解析失败: {e}; raw={p1.stderr[jstart:jend][:300]}"
+        )
+
+    # Pass 2：linear 应用 + 编码 MP3
+    linear_filter = (
+        f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
+        f":measured_I={stats['input_i']}"
+        f":measured_TP={stats['input_tp']}"
+        f":measured_LRA={stats['input_lra']}"
+        f":measured_thresh={stats['input_thresh']}"
+        f":offset={stats['target_offset']}"
+        f":linear=true:print_format=summary"
+    )
+    p2 = subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "info",
+            "-i", str(mp3_in),
+            "-af", linear_filter,
+            "-ar", "48000", "-ac", "1", "-ab", "320k",
+            str(mp3_out),
+        ],
+        capture_output=True, text=True, timeout=180,
+    )
+    if p2.returncode != 0:
+        raise AudioProcessingError(
+            f"master loudnorm pass2 失败: {p2.stderr[-300:]}"
+        )
+
+    # 解析 pass2 summary，提取 input/output LUFS 报告
+    out = {
+        "input_lufs": stats.get("input_i"),
+        "input_tp": stats.get("input_tp"),
+        "input_lra": stats.get("input_lra"),
+        "target_lufs": target_lufs,
+    }
+    for line in p2.stderr.splitlines():
+        m = re.search(r"Output Integrated:\s*(-?[\d.]+)\s*LUFS", line)
+        if m:
+            out["output_lufs"] = float(m.group(1))
+        m = re.search(r"Output True Peak:\s*(-?[\d.]+)\s*dBTP", line)
+        if m:
+            out["output_tp"] = float(m.group(1))
+    return out
 
 
 def _band_rms_db(wav_path: Path, lpf: int, hpf: int) -> float:
@@ -352,21 +446,29 @@ def synthesize(
                     f"voxcpm_tts.synthesize: Resemble Enhance 失败，跳过: {e}"
                 )
 
-        # 2) 音量归一化（EBU R128 loudnorm 两遍，播客标准 -16 LUFS）
-        # 解决不同 voice 录音条件不同（mic/距离/增益）导致音量参差。
-        # 单遍 dynamic 模式对短段命中率 ±1.5 LU；两遍 linear 模式可至 ±0.2 LU。
-        # loudnorm 内置 -ar 48000，会把 Resemble 输出的 44.1k 重采样到 48k。
-        _loudnorm_two_pass(sped_in, norm_out)
-        sped_in = norm_out
+        # 2) Per-segment loudnorm (restored 2026-10-12)
+        # 原因: VoxCPM2 diffusion sampling 会放大参考音频的局部能量峰值。
+        # jiangyu-4 录音本身有强弱表情（"声情并茂"），合成的段内 peak spread 高达 14 dB。
+        # 每段拉到 -16 LUFS / -1.0 dBTP，保证段间 peak spread ≤2 dB；
+        # 行为对齐 MiniMax cloud TTS（其内部 peak limiter 实测 -1.0 dB / 段间 spread 2.2 dB）。
+        # Master loudnorm 已不再需要，见 synthesize_segments() 末尾（原 _master_loudnorm_mp3 处已废弃）。
+        norm_out = tmp_dir / "norm.wav"
+        try:
+            _loudnorm_two_pass(sped_in, norm_out, target_lufs=-16.0, target_tp=-1.0, target_lra=11.0)
+            loudnormed_wav = norm_out
+        except Exception as e:
+            # loudnorm 是 best-effort；失败时退回 raw wav，不阻塞整次合成
+            _log(f"per-segment loudnorm 失败 (seg {i}): {e}; 退回 raw wav")
+            loudnormed_wav = sped_in
 
         # 3) wav→目标格式
         if output_format == "wav":
-            return sped_in.read_bytes()
+            return loudnormed_wav.read_bytes()
 
         ff = subprocess.run(
             [
                 "ffmpeg", "-y", "-v", "error",
-                "-i", str(sped_in),
+                "-i", str(loudnormed_wav),
                 # 48kHz 保留女声 8-12kHz 气声频段（之前 -ar 24000 砍掉导致女声浑浊）
                 "-ar", "48000",
                 "-ac", "1",
@@ -536,6 +638,12 @@ def synthesize_segments(
             progress_callback(done, total)
 
     _concat_mp3(str(output_path), seg_files)
+
+    # Master loudnorm 已废弃 (2026-10-12): 改用 per-segment loudnorm
+    # （见 synthesize() 内的 _loudnorm_two_pass 调用）.
+    # 整 podcast 的段间 LUFS / peak 已在段级归一，这里 _concat_mp3 已直接
+    # 把 concat 结果写到 output_path，不需要再 post-process。
+
     return str(output_path), " → ".join(order_desc)
 
 
