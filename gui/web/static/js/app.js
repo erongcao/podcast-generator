@@ -434,13 +434,13 @@
       return;
     }
     try {
-      // 拉 json 文件，读 editor_text
-      const res = await fetch('/output/' + encodeURIComponent(path.split('/').pop()));
-      // 实际上 scripts 不在 output 目录，要走另一个 endpoint
-      // 简单做法：直接 fetch file://... 不可行，浏览器禁用 file://
-      // 改用：先 fetch 整个 json 再 parse
-      const txt = await fetch(path);
-      const json = await txt.json();
+      // 后端 GET /api/scripts/get?name=... — 2026-10-11 新加
+      const name = path.split('/').pop();
+      const res = await fetch(`/api/scripts/get?name=${encodeURIComponent(name)}`);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${await res.text()}`);
+      }
+      const json = await res.json();
       const text = json.editor_text || (
         (json.segments || []).map(s => `---\n【${s.speaker}】\n${s.text}`).join('\n\n')
       );
@@ -926,6 +926,10 @@
   });
 
   // ========== 启动 ==========
+  // 顶栏登录态（auth-bar.js 已先于本文件加载）
+  if (window.PodcastAuth) {
+    window.PodcastAuth.injectAuthBar();
+  }
   connectWS();
   bootCheck();
   log('前端 JS 加载完成', 'info');

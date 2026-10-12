@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>脚本编辑器 · Podcast Generator</title>
     <link rel="stylesheet" href="/static/css/theme.css">
+    <link rel="stylesheet" href="/static/css/auth-bar.css">
     <link rel="stylesheet" href="/static/css/editor.css">  <!-- Task 4 创建 -->
 </head>
 <body>
@@ -16,6 +17,7 @@
             <span id="dirty-indicator" class="dirty-indicator" hidden>✱</span>
         </div>
         <div class="topbar-right">
+            <div class="auth-bar-slot" id="auth-bar-slot"></div>
             <div class="font-controls" role="group" aria-label="字号">
                 <button id="font-decrease-btn" class="btn btn-small" aria-label="减小字号">A−</button>
                 <button id="font-increase-btn" class="btn btn-small" aria-label="增大字号">A+</button>
@@ -65,6 +67,7 @@
 
     <div id="toast-container" class="toast-container"></div>
 
+    <script src="/static/js/auth-bar.js"></script>
     <script src="/static/js/editor.js"></script>  <!-- Tasks 5-11 创建 -->
 </body>
 </html>

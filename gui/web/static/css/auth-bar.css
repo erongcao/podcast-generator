@@ -1,0 +1,160 @@
+/* auth-bar.css — 顶栏登录态下拉菜单
+ *
+ * 依赖 theme.css 变量：
+ *   --color-white        卡片背景
+ *   --color-cream        hover 浅
+ *   --color-cream-dark   hover 深
+ *   --color-dust         边框
+ *   --color-text         主文字
+ *   --color-text-light   次文字
+ *   --color-totoro       强调色（头像背景）
+ *   --color-forest-dark  管理员 badge
+ *   --color-error        退出按钮文字
+ */
+
+.auth-bar-slot {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+}
+
+/* 主页（index.html）右栏：登录态 + WS + 状态文字 */
+.app-header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.auth-placeholder {
+    color: var(--color-text-light);
+    font-size: 13px;
+    padding: 0 12px;
+    user-select: none;
+}
+
+.auth-login-btn {
+    /* 复用 .btn .btn-primary .btn-small 主题 */
+    text-decoration: none;
+}
+
+.auth-logged-in {
+    position: relative;
+    display: inline-block;
+}
+
+.auth-user-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px 4px 6px;
+}
+
+.auth-avatar {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--color-totoro);
+    color: var(--color-white);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
+.auth-name {
+    font-size: 13px;
+    color: var(--color-text);
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.auth-caret {
+    font-size: 10px;
+    color: var(--color-text-light);
+    margin-left: 2px;
+}
+
+.auth-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 6px;
+    background: var(--color-white);
+    border: 1px solid var(--color-dust);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    min-width: 220px;
+    z-index: 100;
+    overflow: hidden;
+}
+
+.auth-dropdown hr {
+    margin: 0;
+    border: none;
+    border-top: 1px solid var(--color-dust);
+}
+
+.auth-dropdown a,
+.auth-dropdown button {
+    display: block;
+    width: 100%;
+    padding: 8px 14px;
+    text-align: left;
+    background: none;
+    border: none;
+    font-size: 13px;
+    color: var(--color-text);
+    cursor: pointer;
+    text-decoration: none;
+    font-family: inherit;
+    line-height: 1.4;
+}
+
+.auth-dropdown a:hover,
+.auth-dropdown button:hover {
+    background: var(--color-cream-dark);
+}
+
+.auth-info {
+    padding: 12px 14px;
+    background: var(--color-cream);
+}
+
+.auth-name-bold {
+    font-weight: 500;
+    color: var(--color-text);
+    font-size: 13px;
+}
+
+.auth-email {
+    font-size: 12px;
+    color: var(--color-text-light);
+    margin-top: 2px;
+    word-break: break-all;
+}
+
+.auth-admin-badge {
+    display: inline-block;
+    margin-top: 6px;
+    padding: 2px 8px;
+    background: var(--color-forest-dark);
+    color: var(--color-white);
+    border-radius: 3px;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+}
+
+.auth-logout {
+    color: var(--color-error);
+}
+
+.auth-logout:hover {
+    background: var(--color-cream-dark);
+    color: var(--color-error);
+}

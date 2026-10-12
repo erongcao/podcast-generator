@@ -610,8 +610,16 @@ function triggerBlobDownload(blob, filename) {
 // 启动
 // ============================================================
 
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-} else {
+function boot() {
+    // 顶栏登录态（auth-bar.js 已先于本文件加载）
+    if (window.PodcastAuth) {
+        window.PodcastAuth.injectAuthBar();
+    }
     init();
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+} else {
+    boot();
 }
