@@ -1,8 +1,9 @@
 # 患者科普播客生成器 · Patient Podcast Generator
 
-> **v0.4.2-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
+> **v0.4.3-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
 > 底层接 3 个 TTS 引擎：**豆包火山**（云端）/ **MiniMax**（云端）/ **VoxCPM2**（本地 Apple Silicon）。
 > 配套 FastAPI Web 看板（替代旧 PySide6 GUI）+ 全屏 `/editor` 脚本编辑器。
+> **v0.4.3 新增**：新音色上传后自动克隆到 MiniMax（实测出来的规则：voice_id 至少 8 字符）；引擎能查到 SQLite 里的音色。
 > **v0.4.2 新增**：浏览器录音上传统一转码成真 PCM WAV（Safari 录的 mp4/aac 不再顶着 `.wav` 后缀进库）。
 > **v0.4.1 新增**：VoxCPM 段间响度归一化（per-segment loudnorm，-16 LUFS / -1.0 dBTP），jiangyu-4 这类表情 ref 不再忽轻忽响。
 > **v0.4.0 新增**：SQLite + 用户系统（bcrypt + session cookie）+ 遗留 JSON 自动迁移 + 孤儿合成任务修复。
@@ -25,6 +26,7 @@ Originally built for a doctor producing patient-education audio content.
 - [架构总览](#架构总览)
 - [HTTP API 速查](#http-api-速查)
 - [测试](#测试)
+- [v0.4.3-web 新增 音色自动克隆 MiniMax](#v043-web-新增音色自动克隆-minimax)
 - [v0.4.2-web 新增 浏览器录音上传统一转码](#v042-web-新增浏览器录音上传统一转码)
 - [v0.4.1-web 新增 VoxCPM 段间响度归一化](#v041-web-新增-voxcpm-段间响度归一化)
 - [v0.4.0-web 新增 数据库 + 用户系统](#v040-web-新增数据库--用户系统)
@@ -569,6 +571,74 @@ bin/podcast-gui.sh --no-browser   # 关掉自动开
 
 ---
 
+## v0.4.3-web 新增（音色自动克隆 MiniMax + 引擎能查到 DB 音色）
+
+v0.4.2 解决了"录音存成假 WAV"，但随即暴露两个更靠后的问题：
+
+### 问题 1：引擎根本看不见看板录的音色
+
+v0.4.0 把音色存储搬进了 SQLite（`voice_clones`），但 TTS 引擎这侧没跟上 —— `voxcpm_tts._resolve_wav()` 和 `minimax_tts` 的 ID 转换都只查遗留 JSON：
+
+```python
+record = vl.get(voice_id)   # vl = voice_library，只读 voices.json
+```
+
+DB 只在第一次调 `/api/voices` 时把 JSON 导入一次，之后看板新增的音色两边不通：
+
+```
+看板录音 → add_voice_impl 写进 SQLite voice_clones
+ → voxcpm_tts 查 voice_library.get("yujialu") → None
+        → VoiceCloneError: 音色库中不存在 voice_id=yujialu
+```
+
+**修复：** 新增 `voice_resolver.py` —— 引擎查音色的统一入口，先查遗留 JSON 再查 SQLite，返回归一化后的 dict。DB 访问全防御式：CLI 环境下数据库不存在就静默退回 JSON-only，不影响旧流程。
+
+### 问题 2：新音色从来没被克隆到 MiniMax
+
+`voice_clones` 表**连 `minimax_voice_id` 列都没有**，DB 里也没有任何"把音色克隆到 MiniMax"的逻辑。`voice_resolver` 拿不到映射，就把本地 ID 原样发给 MiniMax → `voice id not exist`。
+
+**修复：** 上传成功后自动克隆，结果写回 DB。
+
+### 关键实测规则：MiniMax voice_id 至少 8 字符
+
+这条不是文档里的，是打 API 打出来的：
+
+```
+voice_cloner.clone(wav, "yujialu",   key) → invalid params, voice_id length   # 7 字符
+voice_cloner.clone(wav, "yujialu01", key) → OK                                 # 9 字符
+```
+
+库里 10 条老音色恰好都 ≥ 8 字符（最短的 `cao-test`、`jiang-test` 正好卡 8），所以这条规则一直没被触发，直到录了个 7 字符的 `yujialu`。连字符是可以用的（`Li-test-v1` 就是靠连字符克隆成功的）。
+
+`_minimax_server_id()` 处理这条规则：清洗字符集，长度不足 8 时补 `_clone`（不足则先补够基底长度 —— `"a"` 光加后缀只有 7 字符，照样被拒）。命名跟历史一致：`shanghai-clone-001` / `talarico-clone-001`。
+
+### 改动
+
+| 文件 | 改动 |
+|---|---|
+| `voice_resolver.py` | 新增。引擎查音色的统一入口（JSON → SQLite），DB 访问全防御式 |
+| `gui/web/models.py` | `voice_clones` 加 `minimax_voice_id` / `clone_status` / `clone_error` |
+| `gui/web/app.py` | 启动时 `_ensure_voice_clone_columns()` 幂等 ALTER + `_backfill_minimax_voice_ids()` 回填；新增 `POST /api/voices/{vid}/clone` |
+| `gui/web/api/voices.py` | `_minimax_server_id()` 长度规则；`_clone_to_minimax()` 上传后自动克隆；`clone_voice_impl()` 重试 |
+| `voxcpm_tts.py` / `minimax_tts.py` | 改走 `voice_resolver` |
+| `static/js/app.js` + `theme.css` | 音色库显示 ☁️ 克隆状态徽标 + 「补克隆」按钮；上传后直接播报克隆结果 |
+| `tests/test_voice_resolver.py` | 9 个测试，含核心那条"只在 SQLite 里的音色引擎必须能查到" |
+| `tests/test_voice_clone_on_upload.py` | 14 个测试，含长度规则、幂等、失败留档、duplicate 处理 |
+
+### 几个设计取舍
+
+- **同步克隆**，不丢给后台。单用户本地看板，克隆几秒，换来"上传完就能直接用"的确定性。
+- **失败不回滚音色。** ref 本地已经可用了，VoxCPM 不受影响；`clone_status` / `clone_error` 记录原因，界面上有「重试」按钮。
+- **`voice id duplicate` 当成功。** MiniMax 不允许同名 voice_id，重录同名音色后会一直失败。既然服务端已有一个可用的复刻音色，功能目标已达成，记 `done`。但**不会覆盖**服务端的，tooltip 里留了"未覆盖"说明。
+- **迁移幂等。** `create_all()` 只建缺失的表、**不给已存在的表加列**，所以加字段必须配显式 `ALTER TABLE`（项目没有 Alembic versions 目录）。
+- **回填 JSON 里已有的映射。** 老音色的服务端 ID 只记在 `voices.json` 里；不回填的话界面会把它们全标成"未克隆"，诱导用户重复克隆消耗配额。
+
+### 排查提示
+
+`GET /api/voices` 会返回每条音色的 `clone_status`（`done` / `failed` / `skipped` / 空=未克隆）和 `minimax_voice_id`。MiniMax 报 `voice id not exist` 时先看这里。
+
+---
+
 ## v0.4.2-web 新增（浏览器录音上传统一转码）
 
 用看板 🎤 录音新建音色时，上传的音频现在一律经 ffmpeg 转成 **48 kHz / 单声道 / PCM s16le WAV** 再入库。
@@ -728,6 +798,22 @@ python -m pytest gui/web/tests/  # 跑测试
 - **文档** 新增 `docs/2026-10-12-voxcpm-per-seg-loudnorm.md`（完整调试 + 修复 + 复盘过程）
 - **测试** 144 个单测全过，零回归
 
+### v0.4.3-web (2026-10-21)
+
+- **新增** `voice_resolver.py`：引擎查音色的统一入口，先查遗留 JSON 再查 SQLite
+  - v0.4.0 把存储搬进 `voice_clones` 表，但 `voxcpm_tts._resolve_wav()` 和 `minimax_tts` 只查 `voice_library`（JSON）→ 看板录的音色在引擎眼里不存在，报 `音色库中不存在 voice_id=xxx`
+  - DB 访问全防御式：CLI 环境下数据库不存在就静默退回 JSON-only
+- **新增** 新音色上传后**自动克隆到 MiniMax**，结果写回 DB
+  - `voice_clones` 原本连 `minimax_voice_id` 列都没有，DB 里也没有任何克隆逻辑 → 新音色在 MiniMax 上永远用不了
+- **新增** `POST /api/voices/{vid}/clone` 重试入口
+- **新增** 音色库界面显示 ☁️ 克隆状态徽标（done / 失败 / 未克隆）+「补克隆」按钮
+- **修复** MiniMax `voice_id` 长度下限：**实测至少 8 字符**（7 字符的 `yujialu` 被拒 `invalid params, voice_id length`；9 字符通过）。库里 10 条老音色恰好都 ≥ 8，所以这条规则一直没暴露
+- **修复** `voice id duplicate` 当成功处理：MiniMax 不允许同名 voice_id，重录同名音色后会一直失败；服务端既已有可用复刻音色，功能目标已达成（**不会覆盖**，tooltip 留说明）
+- **修复** 启动时幂等 ALTER TABLE 给 `voice_clones` 补列 —— `create_all()` 只建缺失的表、**不给已存在的表加列**
+- **修复** 启动时把 JSON 里已有的 `minimax_voice_id` 回填进 DB，否则界面会把老音色全标成"未克隆"，诱导重复克隆消耗配额
+- **测试** 新增 `tests/test_voice_resolver.py`（9）+ `tests/test_voice_clone_on_upload.py`（14）；全套 173 个单测全过
+- **验证** 真机跑通：MiniMax 以 `yujialu_clone` 为主播甲合成 8.78s 音频；12 条音色 `clone_status` 全部 `done`
+
 ### v0.4.2-web (2026-10-21)
 
 - **修复** 浏览器录音上传不再直接落盘：新增 `_decode_to_wav()`，统一经 ffmpeg 转成 48 kHz / 单声道 / PCM s16le WAV
@@ -761,4 +847,4 @@ Personal use. No license specified.
 
 ---
 
-**版本：v0.4.2-web（2026-10-21）· git tag `v0.4.2-web` · commit 见 `git log`**
+**版本：v0.4.3-web（2026-10-21）· git tag `v0.4.3-web` · commit 见 `git log`**
