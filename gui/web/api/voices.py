@@ -13,14 +13,15 @@ Storage:
                        (auto-imported once on first /api/voices call)
 
 不在 Phase 5 范围（先不做）：
-    POST /api/voices (新增 / 上传) — 需要 multipart 复杂逻辑；Phase 7+
-    浏览器录音 → POST — 涉及文件上传 + audio cleanup；Phase 7+
+    浏览器录音 → POST 的 audio cleanup（降噪 / 响度归一）：上传只做格式转码，
+    清理走 audio_cleanup.clean_wav_for_cloning，需要时单独跑。
 """
 from __future__ import annotations
 
 import logging
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -317,6 +318,46 @@ class AddVoiceResponse(BaseModel):
     has_wav: bool
 
 
+def _decode_to_wav(data: bytes, dest: Path) -> None:
+    """
+    把上传的音频字节流解码成 48kHz mono PCM WAV，写到 dest。
+
+    为什么必须转码（2026-10-21 修）：
+    浏览器 MediaRecorder 的产物容器跟扩展名/前端声明的 MIME 经常对不上——
+    Safari 在 macOS 上默认录 `audio/mp4`（AAC），Chrome/Firefox 录
+    `audio/webm`（opus）。上传路径以前直接 `shutil.copy2` 到 `{vid}.wav`，
+    于是一个 AAC/MP4 文件顶着 .wav 后缀进了音色库，事后：
+      - `voice_audio_response` 按后缀发 `Content-Type: audio/wav`，浏览器
+        <audio> 拿到 WAV content-type + MP4 负载 → 解码失败，试听报错；
+      - `wave.open()` → `file does not start with RIFF id`；
+      - `soundfile`/libsndfile → `Format not recognised`；
+      - VoxCPM2 / MiniMax clone 拿这个 ref 一样跑不起来。
+
+    所以不能信上传文件名，直接把字节丢给 ffmpeg 解。
+
+    Raises:
+        RuntimeError: ffmpeg 不在 PATH（503，环境问题）。
+        ValueError: ffmpeg 解不出音频（400，用户上传的东西不对）。
+    """
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg 未找到，无法转码上传的录音")
+
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+        tmp.write(data)
+        src = Path(tmp.name)
+
+    try:
+        ff = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+             "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", str(dest)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if ff.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+            raise ValueError(ff.stderr.strip() or "ffmpeg 转码失败（无法识别的音频格式）")
+    finally:
+        src.unlink(missing_ok=True)
+
+
 def add_voice_impl(
     voice_id: str,
     display_name: str,
@@ -326,13 +367,15 @@ def add_voice_impl(
     tags: Optional[List[str]] = None,
 ) -> AddVoiceResponse:
     """
-    上传 WAV 文件，新建一个 voice。
+    上传录音文件，新建一个 voice。
 
     实际写入流程：
-        1. 写临时文件（multipart 已经读到内存）
-        2. 复制到 LEGACY_AUDIO_DIR / {voice_id}.wav
-        3. 写 VoiceClone 表
-        4. 返回 voice_id
+        1. ffmpeg 解码成 48kHz mono PCM WAV → LEGACY_AUDIO_DIR/{voice_id}.wav
+        2. 写 VoiceClone 表
+        3. 返回 voice_id
+
+    输入不要求是 WAV：浏览器 MediaRecorder 可能给 mp4/aac 或 webm/opus，
+    统一在 _decode_to_wav 里转码。
     """
     if not VOICE_ID_PATTERN.match(voice_id):
         raise HTTPException(
@@ -344,21 +387,18 @@ def add_voice_impl(
     if len(file_bytes) > 100 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="文件超过 100MB 限制")
 
-    # 1. 临时文件（HTTP 上传已经在内存里，落到磁盘再原子复制）
-    suffix = ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-
-    # 2. 复制到音频目录
-    dest = LEGACY_AUDIO_DIR / f"{voice_id}{suffix}"
+    # 1. 解码成真正的 48kHz mono PCM WAV 落到音色库目录。
+    #    浏览器录音的容器不可信（Safari = mp4/aac，Chrome = webm/opus），
+    #    见 _decode_to_wav 的 docstring。
+    dest = LEGACY_AUDIO_DIR / f"{voice_id}.wav"
     try:
-        shutil.copy2(tmp_path, dest)
+        _decode_to_wav(file_bytes, dest)
+    except RuntimeError as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        Path(tmp_path).unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"写入音频文件失败: {e}")
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"无法解码上传的音频: {e}")
 
     # 3. 写 DB
     db = SessionLocal()

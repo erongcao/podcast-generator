@@ -257,6 +257,15 @@
   // 浏览器录音
   let mediaRecorder = null;
   let recordedBlob = null;
+  let recordedExt = 'webm';
+  // Safari 在 macOS 上默认录 audio/mp4（AAC），Chrome/Firefox 录 audio/webm（opus）。
+  // 不显式指定 mimeType 时各浏览器给各的默认值，所以先挑一个支持的，再让 Blob
+  // 跟着 recorder 实际的 mimeType 走 —— 之前这里硬编码 'audio/webm'，
+  // Safari 录出来的 AAC 被谎报成 webm（2026-10-21 修）。
+  function pickRecorderMimeType() {
+    const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+    return candidates.find((t) => MediaRecorder.isTypeSupported?.(t)) || '';
+  }
   $('#record-voice-btn').addEventListener('click', () => {
     $('#record-panel').style.display = $('#record-panel').style.display === 'none' ? 'block' : 'none';
   });
@@ -265,11 +274,17 @@
       // 开始
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
+        const mime = pickRecorderMimeType();
+        const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+        // onstop 是异步触发的，那时 mediaRecorder 已经被下面的 else 分支置 null，
+        // 所以 MIME / 扩展名必须在构造时就抓好。
+        const recMime = rec.mimeType || mime || 'audio/webm';
+        mediaRecorder = rec;
         const chunks = [];
-        mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
-        mediaRecorder.onstop = () => {
-          recordedBlob = new Blob(chunks, { type: 'audio/webm' });
+        rec.ondataavailable = (e) => chunks.push(e.data);
+        rec.onstop = () => {
+          recordedBlob = new Blob(chunks, { type: recMime });
+          recordedExt = recMime.includes('mp4') ? 'mp4' : 'webm';
           $('#record-status').textContent = `已录 ${(recordedBlob.size/1024).toFixed(1)} KB`;
           // 显示试听 + 上传
           const url = URL.createObjectURL(recordedBlob);
@@ -283,6 +298,7 @@
           $('#record-upload-btn').addEventListener('click', uploadRecording);
           $('#record-redo-btn').addEventListener('click', () => {
             recordedBlob = null;
+            recordedExt = 'webm';
             $('#record-result').innerHTML = '';
             $('#record-status').textContent = '未录音';
             mediaRecorder = null;
@@ -317,7 +333,7 @@
     const form = new FormData();
     form.append('voice_id', vid);
     form.append('display_name', dname);
-    form.append('file', recordedBlob, `${vid}.webm`);
+    form.append('file', recordedBlob, `${vid}.${recordedExt}`);
     log(`📤 上传录音: ${vid} (${(recordedBlob.size/1024).toFixed(1)} KB)`, 'info');
     try {
       const res = await fetch('/api/voices', { method: 'POST', body: form });
