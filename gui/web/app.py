@@ -55,6 +55,7 @@ from gui.web.api.voices import (  # noqa: E402
     list_voices_impl,
     voice_audio_response,
     delete_voice_impl,
+    clone_voice_impl,
     add_voice_impl,
 )
 from gui.web.api.script_gen import (  # noqa: E402
@@ -111,9 +112,97 @@ def _reconcile_orphaned_syntheses() -> None:
     finally:
         db.close()
 
+
+def _ensure_voice_clone_columns() -> None:
+    """给 voice_clones 补上 MiniMax 克隆相关列（幂等）。
+
+    DB 用 `Base.metadata.create_all()` 建表，而 create_all **只建缺失的表、
+    不给已存在的表加列**。所以给 models.VoiceClone 加字段必须配一个显式的
+    ALTER TABLE，否则老库（已经有 voice_clones 表的）永远拿不到新列。
+
+    项目没有 Alembic versions 目录（见 db.py 的 docstring），所以这里用
+    inspector 判断列是否存在，缺了才 ALTER。SQLite 的 ADD COLUMN 是
+    O(1) 元数据操作，不重写表。
+    """
+    from sqlalchemy import inspect, text
+    from gui.web.db import engine
+    from gui.web.models import VoiceClone  # noqa: F401  确保表已注册
+
+    wanted = {
+        "minimax_voice_id": "VARCHAR(128)",
+        "clone_status": "VARCHAR(16)",
+        "clone_error": "TEXT",
+    }
+    try:
+        inspector = inspect(engine)
+        if "voice_clones" not in inspector.get_table_names():
+            return  # 表还没建（首次启动），create_all 会带上新列
+        existing = {c["name"] for c in inspector.get_columns("voice_clones")}
+        missing = {k: v for k, v in wanted.items() if k not in existing}
+        if not missing:
+            return
+        with engine.begin() as conn:
+            for col, sql_type in missing.items():
+                conn.execute(text(f"ALTER TABLE voice_clones ADD COLUMN {col} {sql_type}"))
+        log.info(f"voice_clones: added columns {sorted(missing)}")
+    except Exception as e:
+        # 迁移失败不该挡住启动——模型层会按缺列报错，至少服务还能起来
+        log.warning(f"voice_clones column migration skipped: {e}")
+
+def _backfill_minimax_voice_ids() -> None:
+    """把遗留 voices.json 里的 minimax_voice_id 回填进 DB（2026-10-21）。
+
+    背景：老音色（jiangyu-4 / shanghai-1 / talarico-james …）是在 JSON 时代克隆到
+    MiniMax 的，服务端 ID 只记在 JSON 的 `minimax_voice_id` 字段里。DB 的
+    `voice_clones` 表补上新列之后，这些行该列是 NULL —— 合成照样能用（resolver
+    先查 JSON），但界面会把它们全标成"未克隆"，误导用户去重复克隆消耗配额。
+
+    只填空值，且只在 JSON 里确实有映射时才填。JSON 里没有的保持 NULL ——
+    那表示"确实还没克隆过"。
+    """
+    import json as _json
+    from gui.web.db import SessionLocal
+    from gui.web.models import VoiceClone
+    from gui.web.api.voices import LEGACY_VOICES_JSON
+
+    if not LEGACY_VOICES_JSON.exists():
+        return
+    try:
+        data = _json.loads(LEGACY_VOICES_JSON.read_text(encoding="utf-8"))
+        legacy = {
+            v["voice_id"]: v.get("minimax_voice_id")
+            for v in (data.get("voices") or [])
+            if isinstance(v, dict) and v.get("voice_id")
+        }
+    except Exception as e:
+        log.warning(f"minimax_voice_id backfill skipped (json read failed): {e}")
+        return
+    if not legacy:
+        return
+
+    db = SessionLocal()
+    try:
+        rows = db.query(VoiceClone).filter(VoiceClone.minimax_voice_id.is_(None)).all()
+        filled = 0
+        for r in rows:
+            server_id = legacy.get(r.voice_id)
+            if server_id:
+                r.minimax_voice_id = server_id
+                r.clone_status = "done"
+                filled += 1
+        if filled:
+            db.commit()
+            log.info(f"Backfilled minimax_voice_id for {filled} legacy voice(s)")
+    except Exception as e:
+        log.warning(f"minimax_voice_id backfill failed: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 app = FastAPI(
     title="Podcast Generator",
-    version="0.4.2-web",
+    version="0.4.3-web",
     description="本地播客生成工具 — Web 看板版（替代 PySide6）",
 )
 
@@ -159,6 +248,12 @@ async def on_startup():
     # 启动时清理 orphan synthesis rows（被 kill mid-synthesis 留下的"running"残骸）
     _reconcile_orphaned_syntheses()
 
+    # 给已有的 voice_clones 表补 MiniMax 克隆列（create_all 不会给老表加列）
+    _ensure_voice_clone_columns()
+
+    # 把 JSON 时代记录的 minimax_voice_id 回填进 DB（列刚补上时全是空的）
+    _backfill_minimax_voice_ids()
+
     # 信号兜底：捕获 SIGTERM / SIGINT（uvicorn 转发的硬杀信号），写 log 留死机痕迹。
     # 必须在 startup 注册；on_shutdown 才注册就晚了（uvicorn 已经在 graceful shutdown）。
     import signal
@@ -195,7 +290,7 @@ async def index():
 @app.get("/health")
 async def health():
     """健康检查 — 启动后 curl 127.0.0.1:8765/health 确认服务在跑。"""
-    return {"ok": True, "version": "0.4.2-web", "phase": 7}
+    return {"ok": True, "version": "0.4.3-web", "phase": 7}
 
 
 @app.get("/api/version")
@@ -203,7 +298,7 @@ async def api_version():
     """前端调一次确认连上了。"""
     return JSONResponse(
         {
-            "version": "0.4.2-web",
+            "version": "0.4.3-web",
             "phase": 7,
             "features": {
                 "parse": True,              # Phase 2 ✅
@@ -441,6 +536,12 @@ async def api_list_voices():
 async def api_voice_audio(vid: str):
     """试听 ref audio（mp3 / wav 直接 stream）。"""
     return voice_audio_response(vid)
+
+
+@app.post("/api/voices/{vid}/clone")
+async def api_clone_voice(vid: str):
+    """把音色克隆到 MiniMax（上传时跳过/失败时的重试入口）。"""
+    return clone_voice_impl(vid)
 
 
 @app.delete("/api/voices/{vid}")

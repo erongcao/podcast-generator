@@ -130,6 +130,13 @@ class VoiceClone(Base):
     tags: Mapped[list] = mapped_column(JSON, default=list)  # ['female', 'foreign', 'voice_design']
     audio_path: Mapped[Optional[str]] = mapped_column(String(1024))
     sample_rate: Mapped[Optional[int]] = mapped_column(Integer)
+    # MiniMax 云端复刻状态（2026-10-21 新增）。
+    # 遗留 voices.json 里有 minimax_voice_id，DB 这边一直没这列，导致看板录的
+    # 音色无法在 MiniMax 上用（voice id not exist）。新音色上传后自动克隆到此。
+    minimax_voice_id: Mapped[Optional[str]] = mapped_column(String(128))
+    # pending=已排队 / done=克隆成功 / failed=克隆失败（可重试）/ skipped=没配 API key
+    clone_status: Mapped[Optional[str]] = mapped_column(String(16))
+    clone_error: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     owner: Mapped["User"] = relationship(back_populates="voice_clones")

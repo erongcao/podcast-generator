@@ -666,25 +666,26 @@ def synthesize_segments(
         for s in speakers_order[2:]:
             speaker_to_voice[s] = voice1_id
 
-    # 把本地 voice_id 解析到 MiniMax 服务端 voice_id（如果 voice_library 有记录）
+    # 把本地 voice_id 解析到 MiniMax 服务端 voice_id（如果音色库有记录）
     # 用户在 GUI 里 voice_map 填的是本地 voice_id（如 "talarico-james"），但 MiniMax
     # /v1/t2a_v2 需要服务端 ID（如 "talarico-clone-001"）。
     # 自动转换：若本地 record 带 minimax_voice_id 字段，则用之；否则原样传。
+    # 走 voice_resolver：看板录的音色只在 SQLite 的 voice_clones 表里，
+    # 只查遗留 JSON 会拿不到映射（2026-10-21 修）。
     try:
-        import voice_library as _vl
+        import voice_resolver as _vr
         _resolved = {}
         for _local_vid in set(speaker_to_voice.values()):
             if not _local_vid:
                 continue
-            _rec = _vl.get(_local_vid)
-            _server_vid = (_rec or {}).get("minimax_voice_id")
+            _server_vid = _vr.resolve_minimax_voice_id(_local_vid)
             _resolved[_local_vid] = _server_vid if _server_vid else _local_vid
         for _sp in list(speaker_to_voice.keys()):
             _orig = speaker_to_voice[_sp]
             if _orig in _resolved:
                 speaker_to_voice[_sp] = _resolved[_orig]
     except Exception as _e:
-        pass  # voice_library 解析失败 → 用原始 ID（保持向后兼容）
+        pass  # 音色库解析失败 → 用原始 ID（保持向后兼容）
 
     # 按段落合成
     segment_files = []

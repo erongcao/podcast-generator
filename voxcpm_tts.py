@@ -488,23 +488,15 @@ def synthesize(
 
 
 def _resolve_wav(voice_id: str):
-    import voice_library as vl
-    from exceptions import VoiceCloneError
+    """
+    取该 voice 的 (wav_path, ref_text)。
 
-    record = vl.get(voice_id)
-    if record is None:
-        raise VoiceCloneError(f"音色库中不存在 voice_id={voice_id}")
-    raw_path = record.get("qwen3_wav_path") or record.get("wav_path")
-    if not raw_path:
-        raise VoiceCloneError(f"voice_id={voice_id} 缺 wav_path")
-    # 优先用清洗过的版本（audio_cleanup.clean_wav_for_cloning 产出）
-    # cleaned.wav 与原 wav 同目录、同 stem，采样率 48kHz、-16 LUFS
-    # 不同 voice 组合时不会出现「底噪/混响/电平不一致」问题
-    cleaned_path = Path(raw_path).with_name(
-        Path(raw_path).stem + ".cleaned.wav"
-    )
-    wav_path = str(cleaned_path) if cleaned_path.exists() else raw_path
-    return wav_path, (record.get("ref_text") or "").strip() or None
+    走 voice_resolver 而不是直接查 voice_library：看板录音存在 SQLite 的
+    voice_clones 表里，只查遗留 JSON 会报"音色库中不存在"（2026-10-21 修）。
+    """
+    import voice_resolver
+
+    return voice_resolver.resolve_wav(voice_id)
 
 
 def synthesize_segments(
@@ -588,8 +580,9 @@ def synthesize_segments(
             )
         wav_path, ref_text = _wav_for(chosen_vid)
         # 读取该 voice 的 tags（用户打的 female/no_enhance 等）
-        import voice_library as vl  # 同 _resolve_wav，独立 import 避免作用域问题
-        _vl_tags = (vl.get(chosen_vid) or {}).get("tags") or []
+        # 同 _resolve_wav 走 voice_resolver：看板录的音色只存在于 SQLite
+        import voice_resolver  # noqa: F401  独立 import 避免作用域问题
+        _vl_tags = (voice_resolver.resolve(chosen_vid) or {}).get("tags") or []
 
         # 选语速
         speed = (speed_map or {}).get(speaker, 1.0)

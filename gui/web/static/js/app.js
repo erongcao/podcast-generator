@@ -113,12 +113,54 @@
         <div class="voice-lib-item">
           <span class="vname">${escapeHtml(v.display_name || v.voice_id)}</span>
           ${tagStr}
-          ${audio} ${del}
+          ${renderCloneBadge(v)} ${audio} ${del}
         </div>
       `;
     }).join('');
     $('#voice-library-list').innerHTML = items;
   }
+
+  // MiniMax 云端复刻状态徽标（2026-10-21）。
+  // 没克隆过的（老行 / 迁移前录的）给一个「补克隆」按钮，点了调
+  // POST /api/voices/{vid}/clone。
+  function renderCloneBadge(v) {
+    const tip = v.clone_error ? ` title="${escapeHtml(v.clone_error)}"` : '';
+    if (v.clone_status === 'done') {
+      return `<span class="vbadge ok"${tip}>☁️ MiniMax</span>`;
+    }
+    if (v.clone_status === 'failed') {
+      return `<span class="vbadge err"${tip}>☁️ 克隆失败</span>` +
+             `<button class="vbtn" onclick="window.cloneVoice('${v.voice_id}')">重试</button>`;
+    }
+    if (v.clone_status === 'skipped') {
+      return `<span class="vbadge warn"${tip}>☁️ 未克隆</span>` +
+             `<button class="vbtn" onclick="window.cloneVoice('${v.voice_id}')">补克隆</button>`;
+    }
+    // clone_status 为空 = 迁移前入库的老音色，从没克隆过
+    return `<span class="vbadge warn"${tip}>☁️ 未克隆</span>` +
+           `<button class="vbtn" onclick="window.cloneVoice('${v.voice_id}')">补克隆</button>`;
+  }
+
+  window.cloneVoice = async function(vid) {
+    log(`☁️ 正在克隆到 MiniMax: ${vid}…`, 'info');
+    try {
+      const res = await fetch(`/api/voices/${encodeURIComponent(vid)}/clone`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+      if (data.clone_status === 'done') {
+        log(`✅ 已克隆到 MiniMax: ${vid} → ${data.minimax_voice_id}`, 'success');
+      } else if (data.clone_status === 'skipped') {
+        log(`⚠️ 跳过克隆 ${vid}: ${data.clone_error || '未配置 MiniMax API key'}`, 'error');
+      } else {
+        log(`❌ 克隆失败 ${vid}: ${data.clone_error}`, 'error');
+      }
+      fetchVoices();
+    } catch (e) {
+      log(`❌ 克隆请求失败: ${e.message}`, 'error');
+    }
+  };
 
   window.previewVoice = function(vid) {
     const audio = new Audio(`/api/voices/${encodeURIComponent(vid)}/audio`);
@@ -343,6 +385,15 @@
       }
       const data = await res.json();
       log(`✅ 上传成功: ${data.voice_id}`, 'success');
+      // 上传时会顺带克隆到 MiniMax（2026-10-21）。克隆失败不回滚音色，
+      // 但要说清楚，否则用户到合成那步才撞上 "voice id not exist"。
+      if (data.clone_status === 'done') {
+        log(`☁️ 已自动克隆到 MiniMax: ${data.minimax_voice_id}`, 'success');
+      } else if (data.clone_status === 'skipped') {
+        log(`⚠️ 跳过 MiniMax 克隆: ${data.clone_error || '未配置 API key'}（VoxCPM 本地仍可用）`, 'error');
+      } else {
+        log(`❌ MiniMax 克隆失败: ${data.clone_error}（可在音色库点「补克隆」重试）`, 'error');
+      }
       fetchVoices();
       // 清掉录音
       recordedBlob = null;

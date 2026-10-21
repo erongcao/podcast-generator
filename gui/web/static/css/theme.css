@@ -410,6 +410,17 @@ html, body {
   font-size: 10px;
   color: var(--color-text-light);
 }
+/* MiniMax 云端复刻状态徽标（2026-10-21） */
+.voice-lib-item .vbadge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.voice-lib-item .vbadge.ok   { color: var(--color-success); border-color: var(--color-success); }
+.voice-lib-item .vbadge.warn { color: #b8860b;          border-color: #b8860b; }
+.voice-lib-item .vbadge.err  { color: var(--color-error); border-color: var(--color-error); }
 
 /* ========== 解析预览 ========== */
 .parse-result {

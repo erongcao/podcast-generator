@@ -88,7 +88,10 @@ def _to_summary(v: VoiceClone) -> "VoiceSummary":
         tags=list(v.tags or []),
         has_wav=has_wav,
         has_preview=has_preview,
-        minimax_voice_id=v.voice_id,  # historical: voice_id == minimax ID for cloned ones
+        # 2026-10-21 起有真列了；老行 clone_status 为空 = 还没克隆过（可重试）
+        minimax_voice_id=v.minimax_voice_id or "",
+        clone_status=v.clone_status or "",
+        clone_error=v.clone_error or "",
         source=source,
         created_at=v.created_at.isoformat() if v.created_at else "",
     )
@@ -183,6 +186,8 @@ class VoiceSummary(BaseModel):
     has_wav: bool = False
     has_preview: bool = False
     minimax_voice_id: str = ""
+    clone_status: str = ""   # "" | pending | done | failed | skipped
+    clone_error: str = ""
     source: str = ""
     created_at: str = ""
 
@@ -316,6 +321,105 @@ class AddVoiceResponse(BaseModel):
     voice_id: str
     display_name: str
     has_wav: bool
+    minimax_voice_id: str = ""
+    clone_status: str = ""
+    clone_error: str = ""
+
+
+class CloneResponse(BaseModel):
+    voice_id: str
+    clone_status: str        # done | failed | skipped
+    minimax_voice_id: str = ""
+    clone_error: str = ""
+
+
+MINIMAX_VOICE_ID_MIN_LEN = 8
+_MINIMAX_INVALID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _minimax_server_id(voice_id: str) -> str:
+    """
+    把本地 voice_id 转成 MiniMax 能接受的服务端 ID。
+
+    **长度下限 8 字符** —— 实测出来的，不是文档里的：
+        voice_cloner.clone(wav, "yujialu", key)       -> "invalid params, voice_id length"（7 字符）
+        voice_cloner.clone(wav, "yujialu01", key)     -> OK（9 字符）
+
+    库里已有的音色恰好都 ≥ 8 字符（最短的 `cao-test` / `jiang-test` 正好 8），
+    所以这条约束一直没被触发，直到录了个 7 字符的 `yujialu`。
+
+    连字符是可用的（`Li-test-v1` 就是靠连字符克隆成功的），所以只清洗字符集，
+    不做多余的替换。命名跟历史保持一致：`shanghai-clone-001` / `talarico-clone-001`。
+    """
+    sid = _MINIMAX_INVALID_CHARS.sub("_", voice_id)
+    if len(sid) >= MINIMAX_VOICE_ID_MIN_LEN:
+        return sid
+    # 补 `_clone` 后仍可能不够长（"_clone" 本身才 6 字符），所以先补够基底长度
+    # 再接后缀——否则 "a" 会得到 7 字符的 "a_clone"，照样被 MiniMax 拒。
+    suffix = "_clone"
+    need = MINIMAX_VOICE_ID_MIN_LEN - len(suffix)
+    if len(sid) < need:
+        sid += "0" * (need - len(sid))
+    return f"{sid}{suffix}"
+
+
+def _clone_to_minimax(db: Session, row: VoiceClone, api_key: str, timeout: int = 120) -> CloneResponse:
+    """
+    把一条音色克隆到 MiniMax 云端，结果写回 DB。
+
+    **失败不回滚音色本身** —— 克隆是云端附加能力，ref 本地已经可用了。
+    失败时 clone_status='failed' + clone_error，用户可以在界面上重试
+    （POST /api/voices/{vid}/clone）。
+
+    幂等：已经有 minimax_voice_id 的行直接返回 done，不重复消耗配额。
+    """
+    def _finish(status: str, server_id: str = "", error: str = ""):
+        row.clone_status = status
+        row.minimax_voice_id = server_id or row.minimax_voice_id
+        row.clone_error = error or None
+        db.commit()
+        return CloneResponse(
+            voice_id=row.voice_id,
+            clone_status=status,
+            minimax_voice_id=row.minimax_voice_id or "",
+            clone_error=error,
+        )
+
+    if not api_key:
+        log.info(f"voice {row.voice_id}: skip MiniMax clone (no api_key)")
+        return _finish("skipped", error="未配置 MiniMax API key，跳过云端复刻")
+
+    if row.minimax_voice_id:
+        return _finish("done")
+
+    wav_path = row.audio_path
+    if not wav_path or not Path(wav_path).exists():
+        return _finish("failed", error=f"ref 音频不存在: {wav_path}")
+
+    # 服务端 voice_id 沿用本地 ID（库里 10 条历史音色都这么做），但要过一遍
+    # _minimax_server_id —— 本地 ID 少于 8 字符时 MiniMax 会拒。
+    server_id = _minimax_server_id(row.voice_id)
+
+    row.clone_status = "pending"
+    db.commit()
+
+    try:
+        import voice_cloner
+        returned = voice_cloner.clone(wav_path, server_id, api_key, timeout=timeout)
+        return _finish("done", server_id=returned or server_id)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        # MiniMax 不允许同名 voice_id，已存在时报 "voice id duplicate"。
+        # 此时 MiniMax 上确实已经有一个可用的复刻音色（目标状态已达成），
+        # 当成功处理——否则用户重录同名音色后就永远克隆不了了。
+        # 注意：**不会覆盖**服务端已有的音色。clone_error 里留一条说明，
+        # 界面上是指针 tooltip，能看到"没覆盖"这件事。
+        if "duplicate" in err.lower() or "已存在" in err:
+            note = f"MiniMax 上已存在同名复刻音色（{server_id}），未覆盖"
+            log.info(f"voice {row.voice_id}: {note}")
+            return _finish("done", server_id=server_id, error=note)
+        log.warning(f"voice {row.voice_id}: MiniMax clone failed: {err}")
+        return _finish("failed", error=err)
 
 
 def _decode_to_wav(data: bytes, dest: Path) -> None:
@@ -435,10 +539,21 @@ def add_voice_impl(
         )
         db.add(v)
         db.commit()
+
+        # 4. 顺带克隆到 MiniMax（2026-10-21 新增）
+        #    同步执行：单用户本地看板，克隆约几秒，换来"上传完就能直接用"的确定性。
+        #    失败不回滚音色——ref 本地已经可用了，clone_status/clone_error 记录原因，
+        #    用户可调 POST /api/voices/{vid}/clone 重试。
+        from gui.web.api.synthesize import _load_minimax_key
+        clone = _clone_to_minimax(db, v, _load_minimax_key())
+
         return AddVoiceResponse(
             voice_id=v.voice_id,
             display_name=v.display_name,
             has_wav=bool(v.audio_path),
+            minimax_voice_id=clone.minimax_voice_id,
+            clone_status=clone.clone_status,
+            clone_error=clone.clone_error,
         )
     except HTTPException:
         raise
@@ -446,5 +561,33 @@ def add_voice_impl(
         db.rollback()
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"添加 voice 失败: {e}")
+    finally:
+        db.close()
+
+
+def clone_voice_impl(vid: str) -> CloneResponse:
+    """
+    重试把某条音色克隆到 MiniMax（上传时没配 key / 克隆失败 / 后台补录的用）。
+
+    幂等：已经克隆成功的直接返回 done。
+    """
+    from gui.web.api.synthesize import _load_minimax_key
+
+    db = SessionLocal()
+    try:
+        try:
+            owner = get_default_owner(db)
+        except RuntimeError:
+            raise HTTPException(status_code=404, detail=f"voice_id 不存在: {vid}")
+
+        v = (
+            db.query(VoiceClone)
+            .filter(VoiceClone.owner_id == owner.id, VoiceClone.voice_id == vid)
+            .first()
+        )
+        if v is None:
+            raise HTTPException(status_code=404, detail=f"voice_id 不存在: {vid}")
+
+        return _clone_to_minimax(db, v, _load_minimax_key())
     finally:
         db.close()
