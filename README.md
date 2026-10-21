@@ -1,8 +1,9 @@
 # 患者科普播客生成器 · Patient Podcast Generator
 
-> **v0.4.1-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
+> **v0.4.2-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
 > 底层接 3 个 TTS 引擎：**豆包火山**（云端）/ **MiniMax**（云端）/ **VoxCPM2**（本地 Apple Silicon）。
 > 配套 FastAPI Web 看板（替代旧 PySide6 GUI）+ 全屏 `/editor` 脚本编辑器。
+> **v0.4.2 新增**：浏览器录音上传统一转码成真 PCM WAV（Safari 录的 mp4/aac 不再顶着 `.wav` 后缀进库）。
 > **v0.4.1 新增**：VoxCPM 段间响度归一化（per-segment loudnorm，-16 LUFS / -1.0 dBTP），jiangyu-4 这类表情 ref 不再忽轻忽响。
 > **v0.4.0 新增**：SQLite + 用户系统（bcrypt + session cookie）+ 遗留 JSON 自动迁移 + 孤儿合成任务修复。
 
@@ -24,6 +25,7 @@ Originally built for a doctor producing patient-education audio content.
 - [架构总览](#架构总览)
 - [HTTP API 速查](#http-api-速查)
 - [测试](#测试)
+- [v0.4.2-web 新增 浏览器录音上传统一转码](#v042-web-新增浏览器录音上传统一转码)
 - [v0.4.1-web 新增 VoxCPM 段间响度归一化](#v041-web-新增-voxcpm-段间响度归一化)
 - [v0.4.0-web 新增 数据库 + 用户系统](#v040-web-新增数据库--用户系统)
 - [CHANGELOG](#changelog)
@@ -567,6 +569,55 @@ bin/podcast-gui.sh --no-browser   # 关掉自动开
 
 ---
 
+## v0.4.2-web 新增（浏览器录音上传统一转码）
+
+用看板 🎤 录音新建音色时，上传的音频现在一律经 ffmpeg 转成 **48 kHz / 单声道 / PCM s16le WAV** 再入库。
+
+**为什么必须转。** 浏览器 `MediaRecorder` 的产物**容器按浏览器不同**，而且跟扩展名对不上：
+
+| 浏览器 | 默认产物 |
+|---|---|
+| Safari（macOS） | `audio/mp4`（AAC） |
+| Chrome / Firefox | `audio/webm`（opus） |
+
+v0.4.1 之前上传路径是 `shutil.copy2` 直接落盘到 `{voice_id}.wav`，完全不看内容。于是 Safari 录的 AAC/MP4 顶着 `.wav` 后缀进了音色库，而 `POST /api/voices` **返回 200 OK**——上传"成功"了，只是文件不能用。后果连锁炸在四个地方：
+
+1. 试听：后端按后缀发 `Content-Type: audio/wav`，浏览器 `<audio>` 拿到 WAV content-type + MP4 负载 → 解码失败
+2. `wave.open()` → `file does not start with RIFF id`
+3. libsndfile → `Format not recognised`
+4. VoxCPM2 / MiniMax clone 拿这个 ref 一样跑不起来
+
+**排查提示：** 上传成功（200）不代表文件可用。别只看 HTTP 码，直接 `ffprobe` 一下：`Stream ... aac (LC) / mp4a` 而不是 `pcm_s16le` 就是中招了。
+
+### 改动
+
+| 文件 | 改动 |
+|---|---|
+| `gui/web/api/voices.py` | 新增 `_decode_to_wav()`：把上传字节交给 ffmpeg 转码。解不出来 → 400 且不留半截文件；ffmpeg 不在 PATH → 503。`add_voice_impl` 不再直接 `shutil.copy2` |
+| `gui/web/static/js/app.js` | 新增 `pickRecorderMimeType()` 显式挑选容器；`Blob` 的 type 跟 `recorder.mimeType` 走（原来硬编码 `audio/webm` 谎报类型）；上传扩展名按实际 MIME 给 |
+| `tests/test_web_voice_upload.py` | 5 个回归测试：mp4/aac、webm/opus、真 wav 三种容器都必须转成 PCM WAV；垃圾输入必须报错且不留文件 |
+
+顺带修掉一个隐藏竞态：`mediaRecorder.stop()` 之后 `mediaRecorder` 立刻被置 `null`，而 `onstop` 是**异步**触发的——所以 MIME 必须在 recorder 构造时就抓好，否则 `onstop` 里读到的会是 `null`。
+
+### 已有的假 WAV 怎么办
+
+v0.4.2 之前入库的音色如果有幸存的假 `.wav`，用同一套逻辑就地修，不用重录：
+
+```bash
+python -c "
+from pathlib import Path
+from gui.web.api.voices import _decode_to_wav
+d = Path.home() / 'Library/Application Support/PodcastGenerator/voices/audio'
+for p in d.glob('*.wav'):
+    p.rename(p.with_suffix('.wav.broken'))
+    _decode_to_wav(p.with_suffix('.wav.broken').read_bytes(), p)
+"
+```
+
+修完验证：`ffprobe` 应显示 `pcm_s16le`，且 `wave.open()` 不再报 `RIFF id`。
+
+---
+
 ## v0.4.1-web 新增（VoxCPM 段间响度归一化）
 
 v0.4.0 时部分音色（典型如 jiangyu-4 这种"声情并茂"录的 ref）在合成后段间响度不稳——有时很轻，有时很响。MiniMax cloud TTS 因为内部 peak limiter（实测 -1.0 dB / 段间 spread 2.2 dB）听感稳定。v0.4.1-web 让 VoxCPM 走同样的响度规范路径。
@@ -677,6 +728,17 @@ python -m pytest gui/web/tests/  # 跑测试
 - **文档** 新增 `docs/2026-10-12-voxcpm-per-seg-loudnorm.md`（完整调试 + 修复 + 复盘过程）
 - **测试** 144 个单测全过，零回归
 
+### v0.4.2-web (2026-10-21)
+
+- **修复** 浏览器录音上传不再直接落盘：新增 `_decode_to_wav()`，统一经 ffmpeg 转成 48 kHz / 单声道 / PCM s16le WAV
+  - Safari 在 macOS 上录的是 `audio/mp4`（AAC），v0.4.1 之前顶着 `.wav` 后缀进库 → 试听解码失败、`wave.open()` 报 `RIFF id`、libsndfile 报 `Format not recognised`、VoxCPM2 / MiniMax clone 全部跑不起来
+  - 上传接口会返回 200 OK，**别只看 HTTP 码**；用 `ffprobe` 确认流是 `pcm_s16le` 而不是 `aac (LC) / mp4a`
+- **修复** 前端录音不再谎报 MIME：`pickRecorderMimeType()` 显式挑容器，`Blob` 的 type 跟 `recorder.mimeType` 走（原来硬编码 `audio/webm`）
+- **修复** 录音上传扩展名按实际 MIME 给（原来恒为 `.webm`）
+- **修复** `mediaRecorder` 置 null 与异步 `onstop` 的竞态：MIME 改为在 recorder 构造时抓好
+- **新增** 不可解码的上传返回 400 且不留半截文件；ffmpeg 缺失返回 503
+- **测试** 新增 `tests/test_web_voice_upload.py`（5 个回归测试）；全套 149 个单测全过
+
 ### v0.4.0-web (2026-10-12)
 
 - 新增 SQLite + SQLAlchemy 2.x + Alembic 数据库
@@ -699,4 +761,4 @@ Personal use. No license specified.
 
 ---
 
-**版本：v0.4.1-web（2026-10-12）· git tag `v0.4.1-web` · commit 见 `git log`**
+**版本：v0.4.2-web（2026-10-21）· git tag `v0.4.2-web` · commit 见 `git log`**
