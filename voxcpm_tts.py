@@ -310,16 +310,129 @@ def _measure_ref_tilt(wav_path: Path) -> float:
 def _needs_resemble(tilt_db: float, tags: list[str] | None = None) -> bool:
     """判定是否对合成输出跑 Resemble Enhance MLX。
 
-    优先级：tag 优先于 tilt 自动判定。
-    - tag 含 "female" 或 "no_enhance" → False（用户明确不要后处理）
-    - 其他情况按 tilt_db > 阈值判定（默认 10 dB，男声低频隆起型）
+    2026-10-22 改（方案 A）：**默认全开**，只有 tag 能关。
 
-    留空 tags 时等价于 []，走纯 tilt 判定（向后兼容）。
+    原来这里只看 tilt > 10 dB（低频隆起），是为男声设计的。实测发现这个门控
+    方向是错的：yao-1 的真实问题是**高频过亮**（tilt 只有 6.1 dB，永远不触发），
+    而 Resemble Enhance 恰好能吃掉那部分高频（实测 -3.9 dB @ 7-12k）。
+    对亮度本来就正常的音色跑一遍近乎无损；对偏亮的音色收益很大。
+
+    - tag 含 "no_enhance" → False（用户明确不要后处理）
+    - 其他 → True
+
+    `female` tag 曾经也等于关闭，但那个语义来自旧 tilt 门控的假设
+    （"女声天然干净"）。实测 yao-1 这个女声恰恰需要处理，所以**移除了**，
+    只留 no_enhance 这个明确的退出开关。
     """
     tags = list(tags or [])
-    if "female" in tags or "no_enhance" in tags:
+    if "no_enhance" in tags:
         return False
-    return tilt_db > _TILT_RESEMBLE_THRESHOLD_DB
+    return True
+
+
+# ============================================================
+# 高频滚降自动校正（方案 A，2026-10-22）
+# ============================================================
+# 背景：VoxCPM2 会忠实地克隆参考音频的**音色**，但不克隆参考的**高频滚降**。
+# 实测 yao-1 前 12s：
+#   原录音  7-12k = -22.2 dB（滚降 31.0 dB）
+#   MiniMax 7-12k = -15.3 dB（滚降 33.7 dB）
+#   VoxCPM  7-12k =  -8.6 dB（滚降 26.2 dB）  ← 高频被抬高了 5 dB
+# 抬亮的那部分既不是噪声、也不是录音里本来就有的东西，是 AudioVAE 解码带出来
+# 的，主观上就是"刺耳 / 齿音重"。这是 VoxCPM 和 MiniMax 最主要的质量差距。
+#
+# Resemble Enhance 能吃掉其中 58%（-8.6 → -12.4），剩下的用高架均衡补。
+# 为什么要"测量"而不是写死固定值：不同音色的自然亮度差很多，写死 -3 dB
+# 会把本来就暗的音色削得更闷。跟**参考音频**比才有意义 —— 那是这个音色
+# "本该"的样子。
+
+_ROLLOFF_LOW = (200, 2000)      # (hpf, lpf) 语音基频 + 共振峰区
+_ROLLOFF_HIGH = (7000, 12000)   # (hpf, lpf) 齿音 / 气声区
+
+# 超过这个差值才动手：小于 deadzone 的属于测量噪声，动它只会引入差异。
+_HF_ROLLOFF_DEADZONE_DB = 1.0
+# 最多削这么多。超了说明"这个音色天生亮"，硬削只会变闷，不如不动。
+_HF_ROLLOFF_MAX_CUT_DB = 4.0
+# 高架中心频率：落在 7-12k 带中央，两侧过渡平缓，不像低架那样砸出凹坑。
+_HF_SHELF_HZ = 9000
+# 实测高架对 7-12k 带的影响约为设定值的 47%（-2.5 dB 架 → 带内 -1.18 dB）。
+# 只用它做第一轮估算，之后一律重新测量再修正。
+_HF_SHELF_EFFICIENCY = 0.47
+
+_rolloff_cache: dict = {}
+
+
+def _measure_rolloff(wav_path: Path) -> float:
+    """测高频滚降 = 中频(0.2-2k) − 高频(7-12k)，正值越大越暗。
+
+    与 `_measure_ref_tilt` 一样按 (路径, mtime) 缓存。
+    """
+    wav_path = Path(wav_path)
+    key = (str(wav_path), wav_path.stat().st_mtime)
+    if key in _rolloff_cache:
+        return _rolloff_cache[key]
+    low = _band_rms_db(wav_path, _ROLLOFF_LOW[1], _ROLLOFF_LOW[0])
+    high = _band_rms_db(wav_path, _ROLLOFF_HIGH[1], _ROLLOFF_HIGH[0])
+    rolloff = low - high  # 正 = 高频相对衰减多 = 暗
+    _rolloff_cache[key] = rolloff
+    return rolloff
+
+
+def _auto_high_shelf(
+    wav_in: Path,
+    wav_out: Path,
+    ref_rolloff_db: float,
+    max_cut_db: float = _HF_ROLLOFF_MAX_CUT_DB,
+) -> float:
+    """把输出的高频滚降拉回参考录音的水平，返回实际施加的衰减（dB，≤0）。
+
+    和参考比而不是和固定值比：这个音色"本该"多暗由参考录音决定。
+    高架滤波对 7-12k 带的影响只有设定值的一半左右，所以**先算、测了再修正**，
+    最多两轮 —— 单轮估算容易欠或过量。
+    """
+    got = _measure_rolloff(wav_in)
+    # rolloff 是"正值=暗"，所以输出比参考亮 ⇔ got 比 ref **小**。
+    # 差值取 ref - got，正值才表示需要削高频。
+    deficit = ref_rolloff_db - got
+    if deficit <= _HF_ROLLOFF_DEADZONE_DB:
+        shutil.copy2(wav_in, wav_out)
+        return 0.0
+
+    cut = -min(deficit, max_cut_db)
+    current = wav_in
+    applied = 0.0
+    for _ in range(2):
+        ff = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(current),
+             "-af", f"equalizer=f={_HF_SHELF_HZ}:t=q:w=1.2:g={cut:.2f}",
+             str(wav_out)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if ff.returncode != 0:
+            raise AudioProcessingError(f"自动高架校正失败: {ff.stderr[-300:]}")
+        applied += cut
+        deficit = ref_rolloff_db - _measure_rolloff(wav_out)
+        if deficit <= _HF_ROLLOFF_DEADZONE_DB:
+            break
+        remaining = min(deficit, max_cut_db + applied)  # applied ≤ 0
+        if remaining <= 0.5:
+            break
+        cut = -(remaining / _HF_SHELF_EFFICIENCY)
+        current = wav_out
+    return applied
+
+
+def _log(msg: str) -> None:
+    """模块级日志出口，给 `synthesize()` 的单段路径用。
+
+    注意 `synthesize_segments()` 内部**还有一个同名闭包**（接 `on_log` 回调，
+    供 GUI 实时显示）。Python 作用域下闭包会遮蔽这里，所以批量合成走的还是
+    那个 —— 这个只在单段直调时兜底。
+
+    以前这里根本没有模块级定义，`synthesize()` 里那行 loudnorm 失败日志
+    是 NameError（只在 loudnorm 真的失败时才炸，所以一直没被发现）。
+    """
+    print(f"[voxcpm] {msg}", flush=True)
 
 
 _model = None
@@ -356,17 +469,18 @@ def synthesize(
         speed: 语速倍数（0.7-1.5；1.0=不变速）。走 ffmpeg atempo 后处理，
                与 VoxCPM 自身参数无关，是变速而非变调。
         use_resemble: 是否对合成输出跑 Resemble Enhance MLX（降噪+去混响）。
-               **默认 False**。由 `synthesize_segments()` 按 ref audio tilt 自动决定：
-               男声 tilt > 10 dB → True；女声 tilt ≤ 10 → False。
-               λ=0.5 实测把 tilt 从 13 dB → 9.2 dB（对齐 MiniMax speech-HD）。
+               函数签名默认 False（单段调用的保守值），但 `synthesize_segments()`
+               走 `_needs_resemble()`：**默认 True**，只有 `no_enhance` tag 才关。
+               λ=0.5 实测把 yao-1 输出的 7-12k 从 -8.6 → -12.4 dB。
 
     Note:
         - 多个连续 atempo 滤镜可串 0.5-2.0 全范围；这里只用 1 个 atempo
           覆盖 0.7-1.5（GUI 滑块范围），更稳。
         - 2026-09-25 极致音质档：30/3.0/2（vs 官方默认 10/2.0/0），
           解决 VoxCPM 输出相对 MiniMax speech-HD 的清晰度/底噪差距。
-        - 2026-09-25 加 Resemble Enhance：补偿 VoxCPM2 AudioVAE V2
-          对男声低频偏置的"忠实克隆"，仅 tilt > 10 的音色启用。
+        - 2026-10-22（方案 A）：Resemble 从"仅 tilt>10 的男声"改成**默认全开**
+          （原门控方向是错的，救不了"太亮"的音色），并新增 `_auto_high_shelf()`
+          按参考录音的高频滚降做自动高架校正。
     """
     wav_path = Path(wav_path)
     if not wav_path.exists():
@@ -428,11 +542,11 @@ def synthesize(
                 )
             sped_in = sped_out
 
-        # 1.5) Resemble Enhance MLX 降噪 + 去混响（仅对 tilt > 10 的音色启用）
-        # 解决 VoxCPM2 AudioVAE V2 对男声低频偏置的"忠实克隆"。
-        # 实测：男声（Li-test）tilt 13 → 9.2 dB（对齐 MiniMax 8.6 dB）。
-        # 女声（jiang-test）tilt ~5 dB 已自然，跳过省算力。
-        # 失败兜底：Resemble 失败时打印 warning 并继续用 sped_in（不阻塞女主）。
+        # 1.5) Resemble Enhance MLX 降噪 + 去混响（2026-10-22 起默认全开）
+        # 原门控是"仅 tilt > 10 的男声"，那个方向是错的：它只管低频隆起，
+        # 救不了 yao-1 这种"高频过亮"的音色（tilt 仅 6.1，永远不触发）。
+        # 改成默认开之后，Resemble 同时吃掉了那 5 dB 的多余高频。
+        # 失败兜底：Resemble 失败时打印 warning 并继续用 sped_in（不阻塞合成）。
         # 注：Resemble 必须在 loudnorm **之前**，因为它会改电平；
         #     loudnorm 会把 enh.wav 重采样到 48kHz（自带 -ar 48000）。
         if use_resemble:
@@ -461,7 +575,23 @@ def synthesize(
             _log(f"per-segment loudnorm 失败 (seg {i}): {e}; 退回 raw wav")
             loudnormed_wav = sped_in
 
-        # 3) wav→目标格式
+        # 3) 高频滚降自动校正（2026-10-22 方案 A）
+        #    VoxCPM2 不克隆参考的高频滚降，抬亮的那部分来自 AudioVAE 解码。
+        #    放在 loudnorm 之后：loudnorm 只改电平不改频谱，放最后最干净，
+        #    且量到的是即将交付的那份音频。
+        eq_out = tmp_dir / "eq.wav"
+        try:
+            shelf_db = _auto_high_shelf(
+                loudnormed_wav, eq_out, _measure_rolloff(Path(wav_path))
+            )
+            if shelf_db < -0.1:
+                _log(f"  高频滚降校正 -{abs(shelf_db):.1f} dB @ {_HF_SHELF_HZ}Hz")
+            loudnormed_wav = eq_out
+        except Exception as e:
+            # best-effort：EQ 失败就退回 loudnorm 后的原始结果，不阻塞合成
+            _log(f"  高频滚降校正失败，退回 raw: {e}")
+
+        # 4) wav→目标格式
         if output_format == "wav":
             return loudnormed_wav.read_bytes()
 
@@ -587,9 +717,8 @@ def synthesize_segments(
         # 选语速
         speed = (speed_map or {}).get(speaker, 1.0)
 
-        # 选是否走 Resemble Enhance：tag 优先 > tilt 自动判定
-        # - tag "female" / "no_enhance" → 跳过（用户明确跳过）
-        # - tilt > 10 → 走 Resemble（男声低频隆起型）
+        # 选是否走 Resemble Enhance：2026-10-22 起默认开，只有 no_enhance tag 才关。
+        # tilt 只用于日志/诊断（门控已不再依赖它）。
         # 测一次缓存，后续同音色直接读缓存。
         tilt = _measure_ref_tilt(Path(wav_path))
         use_resemble = _needs_resemble(tilt, _vl_tags)
@@ -597,8 +726,6 @@ def synthesize_segments(
         suffix = ""
         if use_resemble:
             suffix = "*,RE"
-        elif "female" in _vl_tags:
-            suffix = ",F"
         elif "no_enhance" in _vl_tags:
             suffix = ",N"
         order_desc.append(f"{speaker}({chosen_vid[:12]},tilt={tilt:.1f}{suffix})")
