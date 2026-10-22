@@ -443,7 +443,7 @@ def synthesize(
     wav_path: str,
     ref_text: str = None,
     output_format: str = "mp3",
-    cfg_value: float = 3.0,
+    cfg_value: float = 2.0,
     inference_timesteps: int = 30,
     warmup_patches: int = 2,
     speed: float = 1.0,
@@ -457,9 +457,13 @@ def synthesize(
         wav_path: 参考音频（推荐 10-30s 单人独白）
         ref_text: 可选；不提供时 VoxCPM2 仅用 ref_audio 编码
         output_format: "mp3"（默认）或 "wav"
-        cfg_value: 分类器自由引导强度。**默认 3.0**（极致音质档）。
-               官方默认 2.0 是强制最小值，CLI 会强制 max(cfg_scale, 2.0)。
-               调高增强 voice cloning 约束，过大会失真。
+        cfg_value: 分类器自由引导强度。**默认 2.0 = 模型出厂值**。
+               dit.py:158 的算法是 `uncond×k + cfg×(cond−uncond×k)`，
+               所以 cfg 直接放大"模型先验"与"参考录音"的频谱差：
+               3.0 时 15-25Hz 比参考多 +30.7 dB、4-8k 少 3.3 dB
+               （=背景轰鸣 + 发闷，两个症状同一个成因）；
+               2.0 降到 +20.4 / −0.7，且重跑抖动从 12.1 dB 降到 1.9 dB。
+               CLI 侧 max(cfg_scale, 2.0) —— 2.0 以下是库作者未验证的范围。
         inference_timesteps: diffusion 步数。**默认 30**（极致音质档）。
                官方默认 10 = 最低推荐值；README 原话"Lower = faster, higher = better quality"。
                调高音质明显提升，但 RTF 线性变慢（30 步 ≈ 10 步的 3×）。
@@ -634,7 +638,7 @@ def synthesize_segments(
     voice_id: str = None,
     progress_callback=None,
     output_path: str = None,
-    cfg_value: float = 3.0,
+    cfg_value: float = 2.0,
     inference_timesteps: int = 30,
     warmup_patches: int = 2,
     speaker_map: dict = None,
@@ -649,7 +653,7 @@ def synthesize_segments(
         voice_id: 兜底 voice_id（speaker_map 未命中时回退；旧 API 兼容）
         progress_callback: callable(done, total)
         output_path: 最终合并 mp3 路径
-        cfg_value: 引导强度（默认 3.0，极致音质档）
+        cfg_value: 引导强度（默认 2.0 = 模型出厂值，见 synthesize() 注释）
         inference_timesteps: diffusion 步数（默认 30，极致音质档）
         warmup_patches: 输出前额外 patches（默认 2，极致音质档）
         speaker_map: 角色标签 → voice_id 映射（如 {"主播甲": "Li-test-v1"}）。
