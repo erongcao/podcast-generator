@@ -1,8 +1,9 @@
 # 患者科普播客生成器 · Patient Podcast Generator
 
-> **v0.4.3-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
+> **v0.4.4-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
 > 底层接 3 个 TTS 引擎：**豆包火山**（云端）/ **MiniMax**（云端）/ **VoxCPM2**（本地 Apple Silicon）。
 > 配套 FastAPI Web 看板（替代旧 PySide6 GUI）+ 全屏 `/editor` 脚本编辑器。
+> **v0.4.4 新增**：VoxCPM 输出按参考录音自动校正高频滚降（实测补回 3.9 dB 刺耳感）；Resemble Enhance 默认全开；音色上传修掉「带空格加不进目录」。
 > **v0.4.3 新增**：新音色上传后自动克隆到 MiniMax（实测出来的规则：voice_id 至少 8 字符）；引擎能查到 SQLite 里的音色。
 > **v0.4.2 新增**：浏览器录音上传统一转码成真 PCM WAV（Safari 录的 mp4/aac 不再顶着 `.wav` 后缀进库）。
 > **v0.4.1 新增**：VoxCPM 段间响度归一化（per-segment loudnorm，-16 LUFS / -1.0 dBTP），jiangyu-4 这类表情 ref 不再忽轻忽响。
@@ -26,6 +27,7 @@ Originally built for a doctor producing patient-education audio content.
 - [架构总览](#架构总览)
 - [HTTP API 速查](#http-api-速查)
 - [测试](#测试)
+- [v0.4.4-web 新增 VoxCPM 高频滚降自动校正](#v044-web-新增-voxcpm-高频滚降自动校正)
 - [v0.4.3-web 新增 音色自动克隆 MiniMax](#v043-web-新增音色自动克隆-minimax)
 - [v0.4.2-web 新增 浏览器录音上传统一转码](#v042-web-新增浏览器录音上传统一转码)
 - [v0.4.1-web 新增 VoxCPM 段间响度归一化](#v041-web-新增-voxcpm-段间响度归一化)
@@ -798,6 +800,41 @@ python -m pytest gui/web/tests/  # 跑测试
 - **文档** 新增 `docs/2026-10-12-voxcpm-per-seg-loudnorm.md`（完整调试 + 修复 + 复盘过程）
 - **测试** 144 个单测全过，零回归
 
+### v0.4.4-web (2026-10-22)
+
+**修 VoxCPM "刺耳"的问题**：同一个 `yao-1` 音色，VoxCPM 合成出来比 MiniMax
+明显发亮、齿音重。逐项排除后定位到 VoxCPM2 的 **AudioVAE 解码器把 7-12k 抬高
+约 5 dB**，而且它**不克隆**参考录音的高频滚降（只克隆音色）。
+
+两个改动：
+
+- **Resemble Enhance 默认全开**（`_needs_resemble`）。原门控只看低频倾斜
+  （`tilt > 10`），救不了"太亮"的音色 —— `yao-1` 的 tilt 是 6.1，以前永远
+  进不去。现在只有 `no_enhance` tag 才关。
+- **按参考录音的滚降自动校正**（`_auto_high_shelf`）。先量参考音频的
+  `rolloff = band(200–2000) − band(7000–12000)`，再量合成输出；输出偏亮就加
+  9 kHz 高架衰减（死区 1 dB，最多 −4 dB）。已经够暗的**不动**（只削不推）。
+
+**实测 A/B**（同一个 script、同一组音色，只换管线）：
+
+| 指标 | VoxCPM 旧 | VoxCPM 新 | MiniMax |
+|---|---|---|---|
+| 7-12k（有声帧） | 15.99 dB | **12.12 dB** | 5.16 dB |
+| 谱质心 | 1865 Hz | **1652 Hz** | 1302 Hz |
+| 响度 / LRA | -16.1 / 1.9 | -16.1 / 1.9 | -16.6 / 5.2 |
+
+补回 3.87 dB。**残留差距补不平** —— AudioVAE 是模型固有特性，VoxCPM 的
+定位是本地免费 + 隐私，要自然度仍建议 MiniMax。
+
+另外：
+
+- **修复** 音色上传"加不进目录"：前端 `prompt()` 没 `.trim()`，`"yao-1 "`
+  在客户端就被正则拒掉，请求根本没发出去，后端日志里什么都没有。前后端
+  各加一层 strip，纯空白明确报"不能为空"（5 个回归测试）
+- **修复** `synthesize()` 里潜伏的 `NameError`（`_log` 原本只是
+  `synthesize_segments()` 的闭包），补模块级兜底
+- **测试** 187 个单测全过
+
 ### v0.4.3-web (2026-10-21)
 
 - **新增** `voice_resolver.py`：引擎查音色的统一入口，先查遗留 JSON 再查 SQLite
@@ -847,4 +884,4 @@ Personal use. No license specified.
 
 ---
 
-**版本：v0.4.3-web（2026-10-21）· git tag `v0.4.3-web` · commit 见 `git log`**
+**版本：v0.4.4-web（2026-10-22）· git tag `v0.4.4-web` · commit 见 `git log`**

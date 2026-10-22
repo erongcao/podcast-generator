@@ -202,7 +202,7 @@ def _backfill_minimax_voice_ids() -> None:
 
 app = FastAPI(
     title="Podcast Generator",
-    version="0.4.3-web",
+    version="0.4.4-web",
     description="本地播客生成工具 — Web 看板版（替代 PySide6）",
 )
 
@@ -290,7 +290,7 @@ async def index():
 @app.get("/health")
 async def health():
     """健康检查 — 启动后 curl 127.0.0.1:8765/health 确认服务在跑。"""
-    return {"ok": True, "version": "0.4.3-web", "phase": 7}
+    return {"ok": True, "version": "0.4.4-web", "phase": 7}
 
 
 @app.get("/api/version")
@@ -298,7 +298,7 @@ async def api_version():
     """前端调一次确认连上了。"""
     return JSONResponse(
         {
-            "version": "0.4.3-web",
+            "version": "0.4.4-web",
             "phase": 7,
             "features": {
                 "parse": True,              # Phase 2 ✅
