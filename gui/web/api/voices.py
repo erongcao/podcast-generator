@@ -480,11 +480,21 @@ def add_voice_impl(
 
     输入不要求是 WAV：浏览器 MediaRecorder 可能给 mp4/aac 或 webm/opus，
     统一在 _decode_to_wav 里转码。
+
+    所有文本入参都 strip —— 前端是 prompt() 输入框，用户很容易在 voice_id
+    前后带空格（`"yao-1 "`），而 VOICE_ID_PATTERN 不含空白，直接 400 且
+    前端只弹一行"格式非法"，看起来就像"加不进去"（2026-10-22 排查）。
     """
+    voice_id = (voice_id or "").strip()
+    display_name = (display_name or "").strip()
+    notes = (notes or "").strip()
+    ref_text = (ref_text or "").strip()
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="voice_id 不能为空")
     if not VOICE_ID_PATTERN.match(voice_id):
         raise HTTPException(
             status_code=400,
-            detail=f"voice_id 非法（只允许字母数字下划线连字符，1-64 字符）: {voice_id!r}",
+            detail=f"voice_id 非法（只允许字母数字下划线连字符，1-64 字符，不能含空格）: {voice_id!r}",
         )
     if not file_bytes:
         raise HTTPException(status_code=400, detail="上传的音频文件为空")

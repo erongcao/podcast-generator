@@ -256,13 +256,15 @@
 
   // ========== 上传 / 录制 voice ==========
   $('#upload-voice-btn').addEventListener('click', () => {
-    const vid = prompt('voice_id（字母数字下划线连字符，1-64 字符）：');
+    // 必须 trim：prompt() 里很容易顺手带个空格，而 VOICE_ID_PATTERN 不含空白，
+    // 不 trim 就是一句"格式非法"，用户完全看不出是哪打错了（2026-10-22 修）
+    const vid = (prompt('voice_id（字母数字下划线连字符，1-64 字符）：') || '').trim();
     if (!vid) return;
     if (!VOICE_ID_PATTERN.test(vid)) {
       log('voice_id 格式非法', 'error');
       return;
     }
-    const dname = prompt('显示名称（可空）：', '') || vid;
+    const dname = (prompt('显示名称（可空）：', '') || vid).trim();
     // 选完 id/name 后触发文件选择
     pendingUpload = { voice_id: vid, display_name: dname };
     $('#voice-file-input').click();
@@ -366,12 +368,12 @@
 
   async function uploadRecording() {
     if (!recordedBlob) return;
-    const vid = prompt('voice_id：');
+    const vid = (prompt('voice_id：') || '').trim();
     if (!vid || !VOICE_ID_PATTERN.test(vid)) {
       log('voice_id 格式非法', 'error');
       return;
     }
-    const dname = prompt('显示名称：', '') || vid;
+    const dname = (prompt('显示名称：', '') || vid).trim();
     const form = new FormData();
     form.append('voice_id', vid);
     form.append('display_name', dname);
