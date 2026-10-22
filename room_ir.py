@@ -87,6 +87,26 @@ def _band_reverberant_energy(room: tuple[float, float, float],
     return (8.0 * np.pi * (1.0 - alpha) / (surf * alpha)) * 10.0 ** (wet_db / 10.0)
 
 
+def _soft_highpass(x: np.ndarray, cutoff_hz: float, sr: int) -> np.ndarray:
+    """升余弦斜边高通：cutoff/2 → cutoff 之间平滑过渡，cutoff 以上全通。
+
+    **斜边为什么是一个倍频程（40→80 Hz）而不是更宽或更窄**：
+      - 从 0 Hz 直升到 cutoff 的宽斜边太缓 —— 30-45 Hz 只降 7.2 dB，
+        而整条 30-82 Hz 横跨斜边，均值几乎不降，功能名不副实；
+      - 一个倍频程能真正压住：实测 15-30 Hz 降 73 dB、30-40 降 66 dB、
+        40-50 降 28 dB、50-60 降 10 dB、cutoff 以上 0.00 dB。
+
+    **关于「砖墙会让冲激振铃」**：这个顾虑**只对直达声成立**，所以只要
+    `ir[0]` 永远不过滤器就没事（实测把高通加在含 delta 的整个 IR 上会挂
+    9 个测试）。对混响场本身，砖墙和升余弦斜边实测没有可闻差别 ——
+    rt60=0.25/0.35/0.55 三档下峰均比和 5-50 ms 能量都只差 0.1 dB。
+    升余弦在这里是为了「够陡」，不是为了「防振铃」。
+    """
+    f = np.fft.rfftfreq(len(x), 1.0 / sr)
+    u = np.clip((f - cutoff_hz / 2.0) / (cutoff_hz / 2.0), 0.0, 1.0)
+    return np.fft.irfft(np.fft.rfft(x) * np.sin(np.pi / 2 * u) ** 2, n=len(x))
+
+
 def _band_rt60(band_fc: np.ndarray, rt60: float, hf_ratio: float,
                lf_ratio: float) -> np.ndarray:
     """每条频带的 RT60：以 1 kHz 为基准，向上按 hf_ratio、向下按 lf_ratio 衰减。
@@ -200,28 +220,33 @@ def studio_ir(
         if m.sum() == 0:
             continue
         band = np.fft.irfft(Nf * m, n=n) * np.exp(-6.9078 * t_late / r6)
-        # Parseval: 该带每 bin 的平均功率 = mean(x²)·n/m.sum()
-        # → 要让**逐 bin** 功率 = e6（而不是每带总能量相等），必须这样定标。
-        # 见 _band_reverberant_energy 里第二个坑的说明。
-        rms_want = np.sqrt(e6 * m.sum() / n)
-        band *= rms_want / np.sqrt((band ** 2).mean())
+        # 定标到「该频带每 bin 的功率 = e6」。这里**直接量**实际的每-bin 功率
+        # 再定标，不靠 Parseval 推导 —— 推导错过一次（把 n·mean(x²) 当成
+        # Σ|X|²，漏了一个 n，整条尾巴被放大 43 dB，混响量实测 +26.8 dB，
+        # 比固定标之前还糟）。量出来的就是量出来的。
+        p_bin = (np.abs(np.fft.rfft(band))[m.astype(bool)] ** 2).mean()
+        band *= np.sqrt(e6 / max(p_bin, 1e-30))
         late += band
 
     # 早期反射按含 1 kHz 那条的混响能量定标
     e_share = float(np.clip(early_gain, 0.0, 0.9))
     ir[1:] *= np.sqrt(e_share * rdr[i_ref] / max((ir[1:] ** 2).sum(), 1e-20))
 
-    # 低频高通**只作用于混响尾巴**，直达声保持干净的冲激。
-    # 踩过的坑：把高通加在含直达声的整个 IR 上，砖墙会把 delta 变成
-    # 0.5 s 的 1/t sinc 振铃，卷到语音上等于给每个停顿都填进上一个音的尾巴。
-    # 而直达声不是混响，本来就不该被滤波。
+    # 混响场 = 早期反射 + 晚期尾巴。**低频高通作用在整个混响场上，
+    # 直达声 ir[0] 完全不经过滤波器** —— 早期反射也是混响，不是直达声。
+    #
+    # 踩过的两个坑：
+    #   1. 把高通加在含直达声的整个 IR 上 —— delta 被滤成 1/t 尾巴，卷到
+    #      语音上等于给每个停顿都填进上一个音的尾巴。实测挂 9 个测试。
+    #   2. 只对 late 做高通 —— 早期反射是 6 根冲激，频谱是平的，在 30-82 Hz
+    #      上比整条晚期尾巴还响（实测每 bin 幅度 0.36 vs 0.29）。它们是混响场
+    #      低频的主要来源却没被切到，wet_min_hz=80 实测只降 2.3 dB，
+    #      功能名不副实。修好之后（整个混响场一起滤）降到 13-19 dB。
+    rev = ir[1:] + late[1:]
     if wet_min_hz > 0.0:
-        k = min(n // 2, int(wet_min_hz * n / sr)) or 1
-        late_spec = np.fft.rfft(late)
-        late_spec[:k] = 0.0
-        late = np.fft.irfft(late_spec, n=n)
+        rev = _soft_highpass(rev, wet_min_hz, sr)
+    ir[1:] = rev
 
-    ir[1:] += late[1:]
     # 直达声在最后定死：早期把 late 归一按能量算，late[0] 会是个没有物理意义
     # 的小值（FFT 落点造成的），不写死的话直达声可能不再是全 IR 的最强成分
     # （实测 ir[0] 会掉到 0.83）。
@@ -230,19 +255,26 @@ def studio_ir(
 
 
 def convolve_verb(dry: np.ndarray, ir: np.ndarray, wet: float = 1.0,
-                  sr: int = 48000) -> np.ndarray:
+                  sr: int = 48000, normalize: bool = True) -> np.ndarray:
     """把 IR 卷到干声上。wet=1.0 = 完全湿声（IR 含直达声），
     wet=0 = 全干。用 numpy FFT 免 scipy 依赖。
 
-    输出归一化到**干声的峰值**。副作用要知道：增益取决于 IR 的总能量，
-    所以换一组 IR 参数（比如 `wet_min_hz` 切掉低频）会让输出整体平移零点几 dB
-    ——「湿声 A 比湿声 B 高 0.7 dB」量的其实是峰值归一化，不是房间差别。
-    要跨变体比较电平，必须先各自归一到自己的 RMS（见 tests 里的做法）。
+    Args:
+        normalize: True（默认）时把输出归一化到**干声的峰值**，用于出成品。
+            False 时保留真实电平 —— **量混响量必须用 False**：峰值归一化会
+            把增益按 IR 的总能量整体拉平，而混响/干声的能量比恰恰就是 IR
+            总能量决定的，所以 normalize=True 量的其实是波峰因子，不是混响量
+            （实测 wet_db 加 3 dB 时它纹丝不动）。
+
+    归一化的副作用要知道：增益取决于 IR 的总能量，所以换一组 IR 参数
+    （比如 `wet_min_hz` 切掉低频）会让输出整体平移零点几 dB ——
+    「湿声 A 比湿声 B 高 0.7 dB」量的其实是峰值归一化，不是房间差别。
     """
     n = len(dry) + len(ir)
     size = 1 << (n - 1).bit_length()
     y = np.fft.irfft(np.fft.rfft(dry, size) * np.fft.rfft(ir, size), size)[:n]
-    y = y / max(np.abs(y).max(), 1e-9) * max(np.abs(dry).max(), 1e-9)
+    if normalize:
+        y = y / max(np.abs(y).max(), 1e-9) * max(np.abs(dry).max(), 1e-9)
     if wet < 1.0:
         # 干声要补零到 conv 的长度，否则 (1-wet)*dry 和 wet*y 形状对不上
         padded = np.zeros(n, dtype=y.dtype)
