@@ -260,21 +260,29 @@ def convolve_verb(dry: np.ndarray, ir: np.ndarray, wet: float = 1.0,
     wet=0 = 全干。用 numpy FFT 免 scipy 依赖。
 
     Args:
-        normalize: True（默认）时把输出归一化到**干声的峰值**，用于出成品。
-            False 时保留真实电平 —— **量混响量必须用 False**：峰值归一化会
-            把增益按 IR 的总能量整体拉平，而混响/干声的能量比恰恰就是 IR
-            总能量决定的，所以 normalize=True 量的其实是波峰因子，不是混响量
-            （实测 wet_db 加 3 dB 时它纹丝不动）。
+        normalize: True（默认）时把输出的 **RMS** 拉到干声的 RMS，用于出成品；
+            False 时保留真实电平 —— **量混响量必须用 False**。
 
-    归一化的副作用要知道：增益取决于 IR 的总能量，所以换一组 IR 参数
-    （比如 `wet_min_hz` 切掉低频）会让输出整体平移零点几 dB ——
-    「湿声 A 比湿声 B 高 0.7 dB」量的其实是峰值归一化，不是房间差别。
+    **为什么按 RMS 而不是按峰值归一化**（踩过，这是个把功能废掉的 bug）：
+    混响场的峰均比是 15-18，混响越重输出的峰值就越高。按峰值归一化会
+    按着峰值把**整条信号**往下压，而压下去的正是我们想调的那个量：
+
+        wet_db          未归一输出RMS   峰值归一增益   净效果
+        0  (基线)          −14.88         −2.81       +0.57 dB
+        +6                −13.14         −5.19       +2.31 dB
+        +12               −9.42         −8.64       −2.61 dB
+
+    混响加了 6.03 dB，归一化又减掉 8.64 dB，最后比干声还低 —— 渲染出来
+    的几版几乎一模一样，人耳当然听不出差别。改按 RMS 归一后，三版的
+    净效果是 +0.57 / +2.31 / +6.03 dB，参数才真的线性可控。
     """
     n = len(dry) + len(ir)
     size = 1 << (n - 1).bit_length()
     y = np.fft.irfft(np.fft.rfft(dry, size) * np.fft.rfft(ir, size), size)[:n]
     if normalize:
-        y = y / max(np.abs(y).max(), 1e-9) * max(np.abs(dry).max(), 1e-9)
+        p_dry = float((np.asarray(dry, np.float64) ** 2).mean())
+        p_out = float((y.astype(np.float64) ** 2).mean())
+        y = y * np.sqrt(p_dry / max(p_out, 1e-30))
     if wet < 1.0:
         # 干声要补零到 conv 的长度，否则 (1-wet)*dry 和 wet*y 形状对不上
         padded = np.zeros(n, dtype=y.dtype)

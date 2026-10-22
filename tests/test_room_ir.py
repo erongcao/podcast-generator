@@ -297,14 +297,59 @@ def test_convolve_does_not_boost_the_speech_lf():
 
 # ── 卷积行为 ──────────────────────────────────────────────────────────
 
-def test_convolve_verb_preserves_peak_level():
+def test_convolve_verb_preserves_loudness():
+    """成品归一化按 RMS，不是峰值。
+
+    混响场的峰均比 15-18，混响越重输出峰值越高 —— 按峰值归一化会按着峰值
+    把**整条信号**往下压，压掉的正是要调的那个量（见 `convolve_verb` 里的表）。
+    """
     rng = np.random.default_rng(0)
     dry = (rng.normal(0, 0.1, SR) * np.sin(2 * np.pi * 220 * np.arange(SR) / SR)
            ).astype(np.float32)
     ir = studio_ir(rt60=0.35, sr=SR, seed=0)
     y = convolve_verb(dry, ir, wet=1.0, sr=SR)
     assert y.dtype == np.float32
-    assert np.abs(y).max() == pytest.approx(np.abs(dry).max(), rel=1e-3)
+    rms_d = float((dry.astype(np.float64) ** 2).mean())
+    rms_y = float((y.astype(np.float64) ** 2).mean())
+    assert 10 * np.log10(rms_y / rms_d) == pytest.approx(0.0, abs=0.1), (
+        f"输出 RMS 比干声高了 "
+        f"{10 * np.log10(rms_y / rms_d):+.2f} dB，应归一化到 0 dB")
+
+
+@pytest.mark.parametrize("base", [0.0, 6.0, 12.0])
+def test_more_wet_db_really_makes_the_output_wetter(base):
+    """回归测试：wet_db 加 12 dB，输出必须真的更湿。
+
+    这个 bug 让整个功能形同虚设 —— 按峰值归一化会把加进去的混响又减掉：
+
+        wet_db     未归一输出RMS   峰值归一增益    净效果
+        0            −14.88         −2.81        +0.57 dB
+        +12           −9.42         −8.64        −2.61 dB  ← 比干声还低！
+
+    渲染出来几版几乎一模一样，人耳听不出差别，当时误判成「混响量本来就
+    调不动」。断言必须落在**输出**上，不能只测 IR —— IR 一直是好的。
+    """
+    rng = np.random.default_rng(0)
+    t = np.arange(SR * 4) / SR
+    dry = (rng.normal(0, 0.05, SR * 4)
+           * (np.sin(2 * np.pi * 3 * t) > 0.3)).astype(np.float32)
+
+    def wet_ratio_db(wet_db: float) -> float:
+        """输出里「去掉直达声后的部分」相对干声的能量 —— 用输出算，不用 IR。"""
+        ir = studio_ir(rt60=0.35, sr=SR, seed=1, wet_db=wet_db)
+        y = convolve_verb(dry, ir, 1.0, SR, normalize=True)
+        n = min(len(dry), len(y))
+        d = y[:n].astype(np.float64) - dry[:n].astype(np.float64)
+        p = (dry.astype(np.float64) ** 2).mean()
+        return float(10 * np.log10(max((d ** 2).mean(), 1e-30) / p))
+
+    now = wet_ratio_db(base)
+    if base == 0.0:
+        return                              # 只验证下面两档单调
+    prev = wet_ratio_db(base - 6.0)
+    assert now - prev > 3.0, (
+        f"wet_db {base:.0f} 只比 {base - 6:.0f} 湿了 {now - prev:.1f} dB，"
+        "6 dB 的调整被归一化吃掉了")
 
 
 def test_wet_zero_is_dry():
