@@ -643,6 +643,9 @@ def synthesize_segments(
     warmup_patches: int = 2,
     speaker_map: dict = None,
     speed_map: dict = None,
+    reverb: bool = True,
+    reverb_params: dict = None,
+    reverb_sr: int = 48000,
     on_log=None,
 ):
     """
@@ -659,6 +662,13 @@ def synthesize_segments(
         speaker_map: 角色标签 → voice_id 映射（如 {"主播甲": "Li-test-v1"}）。
                      命中时用对应 voice；未命中回退到 voice_id。
         speed_map: 角色标签 → 语速（0.5-1.5）映射。未命中回退到 1.0。
+        reverb: 默认 True，在 concat 之后给整段成品加演播室混响。
+                False = 交付纯干声（对比用，也给不喜欢混响的听众一条退路）。
+                混响失败不会让合成失败 —— 兜底退回干声。
+        reverb_params: 透传给 _apply_room_reverb 的参数覆盖（None = 用物理基线）。
+                例 {"rt60": 0.25, "room": (5.0, 4.0, 2.8)} = 更小更干的棚。
+        reverb_sr: 混响/末次 loudnorm 的采样率。concat 产物就是 48 kHz，
+                改这个值会触发重采样，一般不用动。
         on_log: callable(str) — 段级日志（"合成段 1/N..."），让用户看到动起来，
                 避免 1 段脚本时进度条卡在 0% 让人误以为程序死了。
 
@@ -767,8 +777,103 @@ def synthesize_segments(
     # （见 synthesize() 内的 _loudnorm_two_pass 调用）.
     # 整 podcast 的段间 LUFS / peak 已在段级归一，这里 _concat_mp3 已直接
     # 把 concat 结果写到 output_path，不需要再 post-process。
+    #
+    # 例外是演播室混响 —— 它必须在 concat **之后**整段做，而且它自己会重开
+    # 一次 loudnorm（见 _apply_room_reverb 的说明）。
+    if reverb:
+        try:
+            _apply_room_reverb(output_path, sr=reverb_sr, **(reverb_params or {}))
+            _log("  演播室混响已加（rt60=0.35 / 7×5×3 m / 物理基线湿声量）")
+        except Exception as e:
+            # 混响是锦上添花，不能因为它把整次合成判失败 —— 退回干声交付。
+            _log(f"  演播室混响失败，保留干声交付: {e}")
 
     return str(output_path), " → ".join(order_desc)
+
+
+def _apply_room_reverb(
+    path: Path,
+    sr: int = 48000,
+    rt60: float = 0.35,
+    room: tuple = (7.0, 5.0, 3.0),
+    wet_db: float = 0.0,
+    wet_min_hz: float = 0.0,
+    pre_delay_ms: float = 8.0,
+    seed: int = 0,
+) -> None:
+    """给整段成品加演播室混响，原地覆盖 path（mp3 进 mp3 出）。
+
+    顺序：解码 → 卷积 → master loudnorm → 重编码。
+
+    **为什么必须在 concat 之后整段做，不能逐段做**
+    段 mp3 是首尾硬接的，中间没有静音。逐段加混响时，段 N 的余响尾巴会盖住
+    段 N+1 的开头 —— 每段边界都出现一次可听的「缝」。整段做的话，段 N 的衰减
+    自然填进段 N+1 的起始，这正是真实房间的行为。
+
+    **为什么必须在 Resemble 之后**
+    Resemble 是**去**混响的。先加的混响会被它减掉，等于白加。
+    完整链路：模型 → Resemble → per-seg loudnorm → HF shelf → concat → 本函数。
+
+    **为什么末尾还要再 loudnorm 一次**
+    per-segment loudnorm 已经在段级做到 -16 LUFS 了，但加混响会把扩散场叠在
+    干声上，整体电平和峰值都会抬。这里补一次 master loudnorm 按 podcast 规范
+    收尾（-16 LUFS / -1.0 dBTP），和段级用的是同一套标准，所以两者不冲突。
+
+    默认值是 Sabine 反推出来的**物理基线**（rt60=0.35 / 7×5×3 m / wet_db=0），
+    不是拍脑袋的甜点值 —— wet_db 是相对它的平移。实测有用的范围只有
+    **−3…0**：+6 就过强（听感"在大厅里喊话"），+3 只是"还可以"。
+
+    Raises:
+        AudioProcessingError: ffmpeg 缺失、卷积失败、或编码失败。
+            调用方负责兜底 —— 混响失败不该让整次合成失败。
+    """
+    from room_ir import convolve_verb, studio_ir
+
+    if not shutil.which("ffmpeg"):
+        raise AudioProcessingError("ffmpeg 未找到，无法加演播室混响")
+
+    path = Path(path)
+    with tempfile.TemporaryDirectory(prefix="reverb_") as td:
+        tdv = Path(td)
+        dec = tdv / "in.wav"          # 解码后的干声（mono / 48k / PCM16）
+        conv = tdv / "conv.wav"       # 卷积后
+        norm = tdv / "norm.wav"       # master loudnorm 后
+        out_mp3 = tdv / "out.mp3"
+
+        # 1) 解码。concat 出来的 mp3 已经是 48k mono，但显式锁死采样率，
+        #    否则 sr 和实际音频对不上，IR 会卷出一个变速的混响。
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(path),
+             "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", str(dec)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            raise AudioProcessingError(f"混响前解码失败: {r.stderr[-300:]}")
+
+        x = sf.read(str(dec), dtype="float32")[0]
+
+        # 2) 卷积。normalize=True 按 RMS 对齐干声 —— 见 room_ir.convolve_verb
+        #    的注释，按峰值归一会把混响量本身给抵消掉。
+        ir = studio_ir(rt60=rt60, sr=sr, pre_delay_ms=pre_delay_ms, room=room,
+                       wet_db=wet_db, wet_min_hz=wet_min_hz, seed=seed)
+        y = convolve_verb(x, ir, wet=1.0, sr=sr, normalize=True)
+        sf.write(str(conv), y, sr, subtype="PCM_16")
+
+        # 3) master loudnorm —— 混响抬完电平后重新收尾
+        _loudnorm_two_pass(conv, norm, target_lufs=-16.0,
+                           target_tp=-1.0, target_lra=11.0)
+
+        # 4) 重编码。写临时文件再 replace，失败时原文件还在。
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(norm),
+             "-c:a", "libmp3lame", "-b:a", "320k", "-ar", str(sr),
+             "-ac", "1", str(out_mp3)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            raise AudioProcessingError(f"混响后编码失败: {r.stderr[-300:]}")
+
+        path.write_bytes(out_mp3.read_bytes())
 
 
 def _concat_mp3(output_path: str, mp3_files: list) -> None:

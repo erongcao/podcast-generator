@@ -22,9 +22,9 @@
   5. **砖墙 vs 升余弦，对混响场没有可闻差别**（rt60 三档实测峰均比和
      5-50 ms 能量只差 0.1 dB）。真正要守的是「**别滤 ir[0]**」——
      直达声被滤会挂 9 个测试。别把这两件事混为一谈。
-  5. **跨变体比电平必须先各自归一**。`convolve_verb` 把输出归一化到干声峰值，
-     增益取决于 IR 的总能量，所以换一组 IR 参数会整体平移零点几 dB
-     （实测 wet_min_hz 切低频后整体 +0.73 dB）。绝对 dB 不可比。
+  5. **跨变体比电平必须先各自归一**。换一组 IR 参数会整体平移零点几 dB
+     （实测 wet_min_hz 切低频后整体 +0.73 dB）。绝对 dB 不可比 —— 每个变体
+     都要各自 `normalize=True` 之后再比。
   6. **测「低频有没有被加重」不能用短时 FFT**。4096 点窗在近静音的停顿帧上，
      低频的泄漏裙边会淹掉 100-300 Hz 的真实内容，而泄漏的来源恰恰是
      我要测的那个低频差异 —— 循环论证。同样的两个信号，整段 FFT 量出
@@ -60,31 +60,56 @@ def measure_rt60(ir: np.ndarray, lo: float, hi: float, expect: float = 0.0,
                  sr: int = SR) -> float | None:
     """测某个频段的 RT60（秒）。返回 None 表示衰减不够深，测不出来。
 
-    **必须先去掉直达声**（ir[0]）。冲激的 DFT 幅度在每个 bin 上都恰好是 1，
+    `expect` 是**预期的 RT60**，用来把拟合起点挪过早期反射峰（见下面「三」）。
+    传 0 = 不跳过（精度差一截，但不会错到离谱）。
+
+    三个必须做的处理，少一个量出来的东西就是废的：
+
+    **一、必须零填充再带通**。np.fft.irfft(rfft(x)*mask, n=len(x)) 是**循环**
+    卷积：带通核的冲激响应会从文件末尾绕回开头，把 t≈0.5 s 的尾巴能量糊到
+    t≈0 上。IR 本身是硬截断的（长度 ≈ 1.4×RT60），被糊之后 EDC 峰值被拉平，
+    −5 dB 提前到几乎 t=0、−25 dB 推到文件末尾，T20 撑满整个 IR ——
+    于是**每一条频带都量出同一个 1.41 s**（150 Hz 到 5 kHz 全部相同），
+    量到的是「IR 的总长度」而不是衰减率。零填充后立刻回到设计值。
+
+    **二、必须先去掉直达声**（ir[0]）。冲激的 DFT 幅度在每个 bin 上都恰好是 1，
     它给每条频带贡献的能量 = 该频带的 bin 数。混响定标到物理值之后，
     直达声在 IR 里是压倒性的主导成分（3-9 kHz 段实测尾部只有直达声的
     6-16%，15-45 Hz 段直达声占 104.7%），不去掉的话量的是冲激不是混响。
 
-    用 Schroeder 反向积分而不是短时窗拟合，两个原因：
-      1. 用上全部数据，不受窗长影响。早先的短时窗版本要靠 `expect` 猜窗长，
-         3-9 kHz 猜低了一倍 → 5.7 ms 窗根本压不住密集噪声的抖动，
-         单调性过滤器卡死 → 返回 None；就算没卡死也量出 0.189 s（真值 0.070）。
-      2. 去掉直达声之后，1 kHz 处的精度从 ±15% 提到 ±2%
-         （rt60=0.25 实测 0.288 → 0.244；0.35 → 0.349；0.50 → 0.471）。
+    **三、必须跳过早期反射峰再拟合**。早期反射是 6 根离散抽头，集中在
+    前 4-35 ms。Schroeder 的 EDC 在那段陡降，−5 dB 提前穿过，于是 T20 的
+    起点被拉到指数尾巴之前，量出来的 RT60 系统性偏**小**，而且 rt60 越短
+    偏得越多（1 kHz 实测：0.25 偏 -21%、0.35 偏 -9%、0.50 偏 -6%）。
+    跳过 expect 的 15% 之后误差降到 ±8% 以内（0.230 / 0.355 / 0.494）。
+    跳过量必须**跟着 expect 缩放** —— 固定跳 20 ms 会把 6-9 kHz 那档
+    （RT60 0.070，20 ms 时早衰减完了）直接测成空。
+
+    用 Schroeder 反向积分而不是短时窗拟合：短时窗要靠 `expect` 猜窗长，
+    3-9 kHz 猜低了一倍 → 5.7 ms 窗根本压不住密集噪声的抖动，单调性过滤器
+    卡死 → 返回 None；就算没卡死也量出 0.189 s（真值 0.070）。
     """
     wet = ir.copy()
     wet[0] = 0.0
     n = len(wet)
-    freqs = np.fft.rfftfreq(n, 1 / sr)
+
+    # 零填充的详细原因见 docstring「一」。x2 就够，再多没有额外收益。
+    n_pad = n * 2
+    padded = np.zeros(n_pad)
+    padded[:n] = wet
+    freqs = np.fft.rfftfreq(n_pad, 1 / sr)
     mask = _soft_bandpass(freqs, lo, hi, max(300.0, (hi - lo) / 4))
-    y = np.fft.irfft(np.fft.rfft(wet) * mask, n=n)
+    y = np.fft.irfft(np.fft.rfft(padded) * mask, n=n_pad)[:n]
 
     edc = np.cumsum((y.astype(np.float64) ** 2)[::-1])[::-1]
-    d = 10 * np.log10(edc / edc.max() + 1e-30)
+
+    # 拟合起点挪过早期反射峰，EDC 按跳过量处的值归零（见 docstring「三」）
+    i0 = int(min(max(0.15 * expect, 0.002) * sr, n - 1))
+    d = 10 * np.log10(edc / max(edc[i0], 1e-30) + 1e-30)
 
     def cross(db_level: float) -> float | None:
-        i = np.nonzero(d <= db_level)[0]
-        return float(i[0] / sr) if len(i) else None
+        i = np.nonzero(d[i0:] <= db_level)[0]
+        return float((i0 + i[0]) / sr) if len(i) else None
 
     t5, t25 = cross(-5.0), cross(-25.0)
     if t5 is None or t25 is None:
