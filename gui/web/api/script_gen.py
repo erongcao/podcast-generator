@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -245,7 +246,7 @@ def _generate_script_thread_minimax(
 
         ws_manager.push({
             "type": "log", "level": "info",
-            "message": "⏳ MiniMax M3 thinking 中（最长 4 分钟）…",
+            "message": "⏳ MiniMax M3 thinking 中（流式，长脚本一般 3-8 分钟）…",
         })
 
         messages = _build_messages_for_topic(
@@ -254,8 +255,12 @@ def _generate_script_thread_minimax(
         raw_text = gen._post(messages, max_tokens=None)
 
         from gui.web.api.parse import parse_script_lines
+        # M3 thinking 模式必带 <think>...</think> 前缀，严格 parser 会拒收
+        # （"脚本开头有未标记的文本"）。先剥掉再走严格解析——否则每次生成都
+        # 白走一遍"⚠ 解析失败"的假警报才回落。fallback 保留，防其他格式漂移。
+        raw_clean = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
         try:
-            segments = parse_script_lines(raw_text)
+            segments = parse_script_lines(raw_clean)
         except ValueError as e:
             ws_manager.push({
                 "type": "log", "level": "warning",
@@ -306,6 +311,14 @@ def _generate_script_thread_minimax(
 # ============================================================
 # 豆包 PodcastTTS 脚本生成（preview 模式，只要台词不要音频）
 # ============================================================
+# 2026-10-26 风格基线：用户要求默认"生动活泼"。豆包 PodcastTTS 是黑盒生成模型，
+# 风格词写进输入文本它会参考（实测权重不如 MiniMax M3 的 system prompt，但有比
+# 没有强）。用户填了「附加要求」时两者叠加，用户的写后面（靠后权重更高）。
+DEFAULT_STYLE_REQUIREMENT = (
+    "对话要生动活泼、口语化：多用短句和句末语气词（呢/啊/嘛/吧/哦），"
+    "适当用设问和感叹号带节奏，避免书面腔和念稿感；"
+    "不用「哈哈」「呵呵」等综艺感语气词，不用 emoji、网络梗和营销话术。"
+)
 def _doubao_texts_to_segments(texts: list) -> List[Dict[str, str]]:
     filtered = [
         t for t in texts
@@ -366,8 +379,10 @@ def _generate_script_thread_doubao(
         text = topic.strip()
         if context.strip():
             text += "\n\n" + context.strip()
+        # 风格基线始终带上；用户的附加要求放后面（位置靠后权重更高）
+        text += "\n\n附加要求：" + DEFAULT_STYLE_REQUIREMENT
         if custom.strip():
-            text += "\n\n附加要求：" + custom.strip()
+            text += "\n" + custom.strip()
         if show_name and show_name != "医学科普播客":
             text = f"（节目：{show_name}）\n" + text
 

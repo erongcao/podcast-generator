@@ -40,7 +40,8 @@ CHAT_URL = "{api_base}/v1/chat/completions"
 
 # 医学播客对脚本生成的核心约束
 # 设计原则（针对用户实际痛点）：
-#   1. 风格克制自然：豆包"嗯啊过度"在医生→患者场景会显得不专业
+#   1. 风格生动但专业：2026-10-26 用户反馈"克制自然"听感偏平，要求多语气词/
+#      短句/设问/感叹号/口语化；仍禁综艺感语气词（哈哈/呵呵/哦豁）和营销话术
 #   2. 严格输出格式：直接对接现有 parser【speaker】\ntext\n\n---\n\n
 #   3. 专业度对齐：可用术语，但首次出现要顺手解释一句
 #   4. 长度可控：避免生成超长脚本导致 TTS 时长失控
@@ -66,7 +67,10 @@ SYSTEM_PROMPT_TEMPLATE = """你是「{show_name}」的播客编剧，负责把�
 主播甲是一个**有血肉的真人**，会震惊、会跑题、会想起身边人、会被说服、也会质疑——不是提词器。
 
 - 每轮字数：**20-60 字**（一到三句话）
-- 语气：轻松自然，像跟朋友聊天，不是主持人念稿
+- 语气：轻松活泼，像跟朋友聊天，不是主持人念稿
+  - **多用短句**：一句话只说一个意思，不写书面长句
+  - **句末语气词自然地用**：呢、啊、嘛、吧、哦（"这事儿可真不少见呢"）
+  - **设问和感叹不用省**："那这风险到底多大呢？""这个数字可把我自己吓了一跳！"
 
 **必用的 8 种互动模式**（每种至少出现 2-3 次）：
 
@@ -109,7 +113,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是「{show_name}」的播客编剧，负责把�
 **主播乙：讲解者 / 信息来源（不是百科词条，是有人味的医生朋友）**
 
 - 每轮字数：**60-150 字**（一段聚焦的内容）
-- 语气：专业可信，像医生朋友跟你聊天
+- 语气：专业可信，像医生朋友跟你聊天——**同样要口语化**：短句为主，可以用设问带节奏（"那这个指标说明什么呢？"），语气词和感叹号都可以用
 - 每轮只回答**一个问题**，不要把多个点塞进一轮
 
 **必用技巧**：
@@ -128,7 +132,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是「{show_name}」的播客编剧，负责把�
 - **绝对不要"为了凑数加废话"**，**也绝对不要"还剩关键点没讲就匆忙道别"**
 - 收尾三步固定：①主播甲抛出总结性问题（如"最后帮我划一下重点？"）→ ②主播乙给完整总结 + 关键数字 + 收尾建议 → ③主播甲预告下期话题 + 道别
 - 段落分隔：用「---」空行隔开每一轮
-- 填充词比例：≤ 3%（一句最多一个"嗯"或"对"），医学话题要显得专业可信
+- 填充词（"嗯""呃""那个"）比例：≤ 3%，一句最多一个——但**句末语气词（呢/啊/嘛/吧/哦）不受此限**，鼓励自然使用
 - **绝对禁止**用"哈哈""呵呵""哦豁"等综艺感语气词
 - **绝对禁止**用 emoji、网络梗、营销话术（"快来评论区告诉我""点赞关注"）
 - **绝对禁止**为角色编造真实姓名（不要用"李医生""张教授"等具体人名，统一用「主播甲」「主播乙」）
@@ -326,39 +330,71 @@ class MiniMaxScriptGenerator:
             "model": self.model,
             "messages": messages,
             "temperature": 1.0,  # thinking 模型推荐 1.0
+            # 2026-10-26：必须流式。非流式的总超时（240s）会把长脚本拦腰砍断
+            # —— "无轮数上限" + thinking 实测要 4-10 分钟，用户连续 3 次
+            # "生成失败"全是这个。流式把超时语义变成「停滞检测」：
+            # 60s 无新数据才判死，token 在流就让它跑完（探针实测流速稳定
+            # ~200 字/s 不停顿）。
+            "stream": True,
         }
         # 不传 max_completion_tokens → 用 API 默认上限（用户要求"无限"）
         if max_tokens is not None:
             payload["max_completion_tokens"] = max_tokens
-        log.info(f"[MiniMax LLM] POST {url} model={self.model} max_tokens={max_tokens or 'unlimited'} thinking=on")
+        log.info(f"[MiniMax LLM] POST {url} model={self.model} max_tokens={max_tokens or 'unlimited'} thinking=on stream=on")
         t0 = time.time()
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            # timeout=(连接超时, chunk 间隔超时)：后者即停滞检测
+            resp = requests.post(url, headers=headers, json=payload,
+                                 stream=True, timeout=(10, 60))
         except requests.Timeout:
-            raise APIError("MiniMax-LLM", f"请求超时 ({self.timeout}s)")
+            raise APIError("MiniMax-LLM", "连接停滞/超时（60s 无响应）")
         except requests.RequestException as e:
             raise APIError("MiniMax-LLM", f"网络错误: {e}")
-        dt = time.time() - t0
         if resp.status_code != 200:
             raise APIError("MiniMax-LLM", f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+        # SSE 累积：content 和 reasoning_content 分开拼
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        usage = {}
         try:
-            data = resp.json()
-        except ValueError as e:
-            raise APIError("MiniMax-LLM", f"非 JSON 响应: {e}")
-        # OpenAI-compatible 格式
-        try:
-            msg = data["choices"][0]["message"]
-            content = msg.get("content") or ""
-        except (KeyError, IndexError, TypeError):
-            raise APIError("MiniMax-LLM", f"响应结构异常: {json.dumps(data)[:200]}")
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue  # 心跳/坏行跳过
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                    if delta.get("reasoning_content"):
+                        reasoning_parts.append(delta["reasoning_content"])
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+        except requests.Timeout:
+            raise APIError("MiniMax-LLM", "生成中途停滞（60s 无新数据），请重试")
+        except requests.RequestException as e:
+            raise APIError("MiniMax-LLM", f"流式读取中断: {e}")
+        finally:
+            resp.close()
+
+        dt = time.time() - t0
+        content = "".join(content_parts)
         # 兜底：如果服务端忽略 thinking 参数又返回 reasoning_content，
         # 把它当作 thinking 块塞进 content 前面，让 parse_script 的
         # `<think>...</think>` 正则能剥掉
-        reasoning = msg.get("reasoning_content") or ""
+        reasoning = "".join(reasoning_parts)
         if reasoning and "<think>" not in content:
             content = f"<think>{reasoning}</think>\n{content}"
+        if not content.strip():
+            raise APIError("MiniMax-LLM", "流式返回为空（0 字符），请重试")
         # usage 信息（如果有）记到 log，便于调试 token 消耗
-        usage = data.get("usage", {})
         if usage:
             log.info(
                 f"[MiniMax LLM] OK in {dt:.1f}s, "

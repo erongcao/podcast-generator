@@ -575,8 +575,12 @@ def synthesize(
             _loudnorm_two_pass(sped_in, norm_out, target_lufs=-16.0, target_tp=-1.0, target_lra=11.0)
             loudnormed_wav = norm_out
         except Exception as e:
-            # loudnorm 是 best-effort；失败时退回 raw wav，不阻塞整次合成
-            _log(f"per-segment loudnorm 失败 (seg {i}): {e}; 退回 raw wav")
+            # loudnorm 是 best-effort；失败时退回 raw wav，不阻塞整次合成。
+            # 2026-10-26 事故：这里曾写 f"seg {i}"，但 i 是 synthesize_segments
+            # 的循环变量，本函数作用域里没有 —— NameError 把真实的 loudnorm
+            # 错误整个盖住（9c2c42a 只补了模块级 _log，没发现 {i} 也炸）。
+            # 段号由调用方在进本函数前打日志，这里改用 text 预览做关联。
+            _log(f"per-segment loudnorm 失败: {e}; 退回 raw wav (text: {text[:20]!r})")
             loudnormed_wav = sped_in
 
         # 3) 高频滚降自动校正（2026-10-22 方案 A）

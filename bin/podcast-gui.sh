@@ -103,9 +103,10 @@ fi
 if [ "$STOP_ONLY" = "1" ]; then
   if [ ! -f "$PID_FILE" ]; then
     echo "▶ uvicorn 未在跑（无 pid 文件）"
-    # 兜底：按端口杀
+    # 兜底：按端口杀（只看 LISTEN，否则 Safari 标签页的 WebKit
+    # 客户端连接也会被当成占用 —— 2026-10-26 踩过）
     if command -v lsof >/dev/null 2>&1; then
-      LPID=$(lsof -ti:"$PORT" 2>/dev/null || true)
+      LPID=$(lsof -ti:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
       if [ -n "$LPID" ]; then
         echo "  但端口 $PORT 被 PID=$LPID 占用，杀一下"
         kill "$LPID" 2>/dev/null || true
@@ -230,9 +231,10 @@ fi
 # ============================================================
 # 默认：启动 web 看板
 # ============================================================
-# 检查端口是否被占
+# 检查端口是否被占（-sTCP:LISTEN：Safari 开着看板标签页时 WebKit 的
+# 客户端连接也匹配 :8765，不过滤会误判"端口被占"拒绝启动）
 if command -v lsof >/dev/null 2>&1; then
-  EXISTING=$(lsof -ti:"$PORT" 2>/dev/null | head -1 || true)
+  EXISTING=$(lsof -ti:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
   if [ -n "$EXISTING" ]; then
     # 看是否是我们的 pid_file
     if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$EXISTING" ]; then
