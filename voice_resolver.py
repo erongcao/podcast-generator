@@ -17,9 +17,11 @@ MiniMax 侧还会退化成"把本地 ID 原样发给 MiniMax" → voice id not e
 
 **本模块的策略**
 
-两个存储都查，先遗留 JSON 后 SQLite，返回归一化后的 dict，让引擎只认一种形状。
-选这个方向而不是"把 JSON 迁干净就完事"的理由：CLI / 旧 Qt 面板仍然直接写
-`voice_library`，硬砍会让那条路断掉；两边都查则两边都活。
+两个存储都查，先 SQLite 后遗留 JSON，返回归一化后的 dict，让引擎只认一种形状。
+Web 上改过的音色在数据库里。若 JSON 优先，一份过期的 voices.json 会盖住
+网页上的修改。JSON 仍是数据库不在时的退路（CLI 经常如此），不删。
+选两边都查而不是"把 JSON 迁干净就完事"：CLI / 旧 Qt 面板仍然直接写
+`voice_library`，硬砍会让那条路断掉。
 
 DB 访问一律防御式——CLI 环境下数据库可能根本不存在或没建表，此时静默退回
 JSON-only 行为，不影响既有流程。
@@ -108,7 +110,7 @@ def _from_db(voice_id: str) -> Optional[dict]:
 
 def resolve(voice_id: str) -> Optional[dict]:
     """
-    查一条音色记录，先遗留 JSON 后 SQLite。
+    查一条音色记录，先 SQLite 后遗留 JSON。
 
     Returns:
         dict 或 None。归一化后的字段：
@@ -118,7 +120,7 @@ def resolve(voice_id: str) -> Optional[dict]:
     """
     if not voice_id:
         return None
-    return _from_legacy_json(voice_id) or _from_db(voice_id)
+    return _from_db(voice_id) or _from_legacy_json(voice_id)
 
 
 def resolve_wav(voice_id: str):

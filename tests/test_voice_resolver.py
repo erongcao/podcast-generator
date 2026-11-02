@@ -18,7 +18,15 @@ import pytest
 
 @pytest.fixture
 def legacy_json(tmp_path, monkeypatch):
-    """一个只含遗留 JSON 的环境（DB 查询会失败并静默退回）。"""
+    """一个只含遗留 JSON 的环境（DB 查询会失败并静默退回）。
+
+    resolve() 先查数据库。这里让 SessionLocal 直接失败，测试才不会打开
+    ~/.podcast-automation/podcast.db，也才盖得住「JSON 仍是退路」。
+    """
+    def _boom(*a, **k):
+        raise RuntimeError("no database in this fixture")
+
+    monkeypatch.setattr("gui.web.db.SessionLocal", _boom, raising=False)
     monkeypatch.setattr("voice_library.VOICES_DIR", tmp_path)
     monkeypatch.setattr("voice_library.VOICES_JSON", tmp_path / "voices.json")
     (tmp_path / "voices.json").write_text(
@@ -178,3 +186,28 @@ def test_voxcpm_resolve_wav_uses_resolver(legacy_json):
     wav_path, ref_text = voxcpm_tts._resolve_wav("json-only")
     assert wav_path == str(raw)
     assert ref_text == "参考文本"
+
+
+def test_db_record_wins_over_legacy_json(monkeypatch):
+    """两边都有时以数据库为准。过期的 voices.json 不能盖住网页上的修改。"""
+    import voice_resolver
+
+    monkeypatch.setattr(voice_resolver, "_from_db", lambda vid: {
+        "voice_id": vid,
+        "display_name": "来自数据库",
+        "minimax_voice_id": "db-server",
+        "wav_path": "/tmp/db.wav",
+        "_source": "db",
+    })
+    monkeypatch.setattr(voice_resolver, "_from_legacy_json", lambda vid: {
+        "voice_id": vid,
+        "display_name": "来自 JSON",
+        "minimax_voice_id": "json-server",
+        "wav_path": "/tmp/json.wav",
+    })
+
+    rec = voice_resolver.resolve("both")
+    assert rec["display_name"] == "来自数据库"
+    assert rec["minimax_voice_id"] == "db-server"
+    assert rec["wav_path"] == "/tmp/db.wav"
+    assert voice_resolver.resolve_minimax_voice_id("both") == "db-server"

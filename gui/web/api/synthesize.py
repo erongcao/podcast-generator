@@ -4,7 +4,7 @@ synthesize.py — 合成路由
 VoxCPM2 本地合成。Phase 3 只做这一个引擎；MiniMax / 豆包在 Phase 4。
 
 关键设计：
-    - 用 FastAPI BackgroundTasks 把合成扔到线程池（不阻塞事件循环）
+    - 用 gui.web.jobs 的单线程队列跑合成（不阻塞事件循环，也不会两份一起跑）
     - 合成线程里调 voxcpm_tts.synthesize_segments(...) 走原 on_log / progress_callback
     - 这些回调把消息 push 到 ws_manager，前端 WebSocket 实时收到
 
@@ -43,6 +43,7 @@ def _create_synthesis(
     voice_map: Dict[str, str],
     speed_map: Dict[str, float],
     engine: str,
+    status: str = "running",
 ) -> Optional[Synthesis]:
     """
     Create scratch Script + Synthesis rows. Returns the Synthesis (with .id),
@@ -80,13 +81,15 @@ def _create_synthesis(
             engine=engine,
             voice_map=voice_map or {},
             speed_map=speed_map or {},
-            status="running",
-            started_at=ts,
+            status=status,
+            started_at=ts if status == "running" else None,
             created_at=ts,
         )
         db.add(synth)
         db.commit()
         db.refresh(synth)
+        # 关掉 session 之后调用方还要读 .id。先 expunge，避免 detached 过期。
+        db.expunge(synth)
         return synth
     except Exception as e:
         log.warning(f"Failed to create Synthesis row: {e}")
@@ -149,6 +152,48 @@ def _fail_synthesis(synth: Optional[Synthesis], error_message: str) -> None:
         db.close()
 
 
+def _mark_running(synth_id: int) -> None:
+    """队列真正开始跑时，把 pending 行改成 running。"""
+    db = SessionLocal()
+    try:
+        row = db.get(Synthesis, synth_id)
+        if row is None:
+            return
+        row.status = "running"
+        if row.started_at is None:
+            row.started_at = utcnow()
+        db.commit()
+    except Exception as e:
+        log.warning(f"Failed to mark synthesis {synth_id} running: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+class _SynthRef:
+    """只留 id。完成 / 失败时按 id 再开 session，不把 ORM 对象带出 session。"""
+
+    def __init__(self, synth_id: int) -> None:
+        self.id = synth_id
+
+
+def _claim_synthesis(
+    segments: List[Dict[str, str]],
+    voice_map: Dict[str, str],
+    speed_map: Dict[str, float],
+    engine: str,
+    synth_id: Optional[int],
+) -> Optional[_SynthRef]:
+    """路由已经建了 pending 行就把它标成 running；直接调用时就地建 running 行。"""
+    if synth_id is None:
+        created = _create_synthesis(segments, voice_map, speed_map, engine, status="running")
+        if created is None:
+            return None
+        return _SynthRef(created.id)
+    _mark_running(synth_id)
+    return _SynthRef(synth_id)
+
+
 # ============================================================
 # /api/synthesize/voxcpm
 # ============================================================
@@ -162,6 +207,7 @@ class SynthesizeStartResponse(BaseModel):
     status: str
     task_id: str
     output: str
+    ahead: int = 0
 
 
 def _check_voice_coverage(segments: List[Dict], voice_map: Dict[str, str]) -> str:
@@ -185,9 +231,10 @@ def synthesize_voxcpm_thread(
     voice_map: Dict[str, str],
     speed_map: Dict[str, float],
     output_path: str,
+    synth_id: Optional[int] = None,
 ) -> None:
     """
-    实际跑合成的线程函数。由 BackgroundTasks 调起。
+    实际跑合成的线程函数。由进程内队列调起。
 
     通过 ws_manager.push 实时推：
         {"type": "log", "level": "info"|"success"|"warning"|"error", "message": str}
@@ -197,7 +244,7 @@ def synthesize_voxcpm_thread(
 
     DB tracking: 创建 Script (scratch) + Synthesis rows；done 时创建 Output。
     """
-    synth = _create_synthesis(segments, voice_map, speed_map, engine="voxcpm")
+    synth = _claim_synthesis(segments, voice_map, speed_map, "voxcpm", synth_id)
 
     def on_log(msg: str) -> None:
         ws_manager.push({"type": "log", "level": "info", "message": msg})
@@ -338,6 +385,7 @@ def synthesize_minimax_thread(
     api_key: str,
     model: str,
     output_path: str,
+    synth_id: Optional[int] = None,
 ) -> None:
     """MiniMax 合成线程。
 
@@ -346,7 +394,7 @@ def synthesize_minimax_thread(
 
     DB tracking: 创建 Script (scratch) + Synthesis rows；done 时创建 Output。
     """
-    synth = _create_synthesis(segments, voice_map, speed_map, engine="minimax")
+    synth = _claim_synthesis(segments, voice_map, speed_map, "minimax", synth_id)
 
     def on_log(msg: str) -> None:
         ws_manager.push({"type": "log", "level": "info", "message": msg})
@@ -449,6 +497,7 @@ def synthesize_doubao_thread(
     appid: str,
     token: str,
     output_path: str,
+    synth_id: Optional[int] = None,
 ) -> None:
     """
     豆包走 doubao_podcast.generate_podcast (async WSS)。
@@ -464,7 +513,7 @@ def synthesize_doubao_thread(
 
     # voice_map 字段在 DB 里也需要存一下（豆包的 speaker 是火山引擎 voice_id 列表）
     voice_map = {f"speaker_{i}": spk for i, spk in enumerate(speakers or [])}
-    synth = _create_synthesis(segments, voice_map, {}, engine="doubao")
+    synth = _claim_synthesis(segments, voice_map, {}, "doubao", synth_id)
 
     # 捕获 PodcastTTS 的日志转发到 ws_manager
     doubao_logger = logging.getLogger("PodcastTTS")

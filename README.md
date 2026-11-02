@@ -1,8 +1,9 @@
 # 患者科普播客生成器 · Patient Podcast Generator
 
-> **v0.4.4-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
+> **v0.4.5-web** · 把文档/URL/粘贴文本转成甲乙双主播科普音频。
 > 底层接 3 个 TTS 引擎：**豆包火山**（云端）/ **MiniMax**（云端）/ **VoxCPM2**（本地 Apple Silicon）。
 > 配套 FastAPI Web 看板（替代旧 PySide6 GUI）+ 全屏 `/editor` 脚本编辑器。
+> **v0.4.5 新增**：合成和脚本生成进同一条进程内队列；音色以数据库为准，过期的 voices.json 不再盖住网页修改；`/api`、`/output`、`/ws` 只允许本机。详见 `docs/2026-11-02-本地单用户与合成队列.md`。
 > **v0.4.4 新增**：VoxCPM 输出按参考录音自动校正高频滚降（实测补回 3.9 dB 刺耳感）；Resemble Enhance 默认全开；音色上传修掉「带空格加不进目录」。
 > **v0.4.3 新增**：新音色上传后自动克隆到 MiniMax（实测出来的规则：voice_id 至少 8 字符）；引擎能查到 SQLite 里的音色。
 > **v0.4.2 新增**：浏览器录音上传统一转码成真 PCM WAV（Safari 录的 mp4/aac 不再顶着 `.wav` 后缀进库）。
@@ -463,7 +464,7 @@ docs/superpowers/               # 设计文档（specs + plans）
 | GET  | `/editor`                     | 全屏脚本编辑器（v0.3.1-web 新增）|
 | GET  | `/health`                     | 健康检查 |
 | GET  | `/api/version`                | 后端版本 + features |
-| GET  | `/api/credentials`            | 凭证加载状态（prefix only，不返明文）|
+| GET  | `/api/credentials`            | 凭证是否已配置（不返回密钥、前缀或长度）|
 | POST | `/api/parse`                  | 脚本解析 |
 | POST | `/api/synthesize/voxcpm`      | VoxCPM2 本地合成（异步 + WebSocket）|
 | POST | `/api/synthesize/minimax`     | MiniMax 云端合成 |
@@ -564,8 +565,9 @@ bin/podcast-gui.sh --no-browser   # 关掉自动开
 
 ## 已知局限
 
+- **仍是单用户**：登录不是强制的。新的合成、脚本、音色记在第一个管理员（没有管理员就记第一个用户）名下。
 - **macOS-only voice library 路径**：`voice_library.py` hardcode `~/Library/Application Support/...`。Linux/Windows 需 XDG/AppData 支持。
-- **API key 在 config.json 明文**：任何有文件读权限的进程都能拿到。OS keyring 集成在 roadmap。
+- **API key 在 config.json 明文**：任何有文件读权限的进程都能拿到。`/api/credentials` 不再回前缀和长度。OS keyring 集成在 roadmap。
 - **豆包无 per-segment progress**：只能在 done / error 边界报状态，中间过程走 WS log。
 - **AI 生成强依赖 MiniMax M3**：无 key 时 AI 生成按钮不可用，但脚本粘贴 / 导入路径独立可用。
 - **VoxCPM2 限 Apple Silicon + Python 3.10+**：其他平台只能跑云端引擎。
@@ -793,6 +795,20 @@ python -m pytest gui/web/tests/  # 跑测试
 
 ## CHANGELOG
 
+### v0.4.5-web (2026-11-02)
+
+- **合成和脚本生成共用一条进程内队列**，一次只跑一个。WebSocket 消息带 `task_id`，看板丢掉不是当前任务的 log / progress / done / error。`script_done` 仍然收下。
+- **重启时**，所有 `pending` 和 `running` 的合成行立刻标为失败（不再只处理超过 1 小时的 `running`）。队列在这之后才启动。
+- **音色查找先数据库、后遗留 JSON**。数据库不在时仍退回 JSON，CLI 不受影响。
+- **`/api`、`/output`、`/ws` 只允许本机**（含 Starlette 的 `testclient`）。页面和 `/health` 仍可打开。不强制登录，否则现有看板会坏。
+- **`/api/credentials` 不再返回密钥前缀和长度**，只返回有没有配。
+- **去掉** SIGINT/SIGTERM 里调用 `sys.exit(0)` 的处理。那个处理会跳过 uvicorn 的收尾。
+- **Alembic** `d5f8a21c6e40` 为 `voice_clones` 补 `minimax_voice_id` / `clone_status` / `clone_error`，可重复执行。启动时的 ALTER 仍保留，因为启动器不跑 alembic。
+- **版本号**收到 `gui/web/version.py`，当前 `0.4.5-web`。
+- **没做**：不删 Qt / customtkinter / `podcast_generator.py`；不把密钥改成加密存储；不把每条记录改成按登录用户隔离。
+
+记录：`docs/2026-11-02-本地单用户与合成队列.md`。
+
 ### v0.4.1-web (2026-10-12)
 
 - **修复** VoxCPM 段间响度抖动：恢复 per-segment loudnorm（EBU R128, target=-16 LUFS / -1.0 dBTP / LRA 11），删除冗余 master loudnorm。jiangyu-4 这类"声情并茂"ref 段间 peak spread 从 14.5 dB 降到 0.66 dB
@@ -884,4 +900,4 @@ Personal use. No license specified.
 
 ---
 
-**版本：v0.4.4-web（2026-10-22）· git tag `v0.4.4-web` · commit 见 `git log`**
+**版本：v0.4.5-web（2026-11-02）· 版本字符串见 `gui/web/version.py`**

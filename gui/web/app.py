@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect  # noqa: E402
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
@@ -35,6 +35,9 @@ from pydantic import BaseModel  # noqa: E402
 
 from gui.web.ws import ws_manager  # noqa: E402
 from gui.web.auth import SESSION_SECRET, SESSION_MAX_AGE  # noqa: E402
+from gui.web.jobs import enqueue, start_worker  # noqa: E402
+from gui.web.local_only import LocalOnlyMiddleware  # noqa: E402
+from gui.web.version import VERSION  # noqa: E402
 from gui.web.paths import STATIC_DIR  # noqa: E402
 from gui.web.api.auth import router as auth_router  # noqa: E402
 from gui.web.api.synthesize import (  # noqa: E402
@@ -45,6 +48,7 @@ from gui.web.api.synthesize import (  # noqa: E402
     build_output_path,
     build_minimax_output_path,
     build_doubao_output_path,
+    _create_synthesis,
     synthesize_voxcpm_thread,
     synthesize_minimax_thread,
     synthesize_doubao_thread,
@@ -75,26 +79,24 @@ log = logging.getLogger(__name__)
 
 
 def _reconcile_orphaned_syntheses() -> None:
-    """Mark any Synthesis rows stuck in 'running' as failed at server boot.
+    """Fail every pending or running Synthesis left by the previous process.
 
-    If the process is killed mid-synthesis (OOM, SIGKILL, hard crash),
-    Synthesis rows stay 'status=running' forever with no finished_at —
-    there's no watchdog to clean them up. This hook runs ONCE at startup
-    and reconciles any row whose started_at is > 1h ago (forgiving enough
-    that legitimately-running syntheses aren't disturbed).
+    The in-process queue dies with the process. On the next boot those rows
+    are not still working, so they are failed immediately — no one-hour grace.
+    Call this before start_worker(), or a job the new worker just took would
+    be marked failed too.
 
     Error message: 'orphaned by process restart' — operators can grep for it.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
     from gui.web.db import SessionLocal
     from gui.web.models import Synthesis
 
     db = SessionLocal()
     try:
-        threshold = datetime.now(timezone.utc) - timedelta(hours=1)
         orphaned = (
             db.query(Synthesis)
-            .filter(Synthesis.status == "running", Synthesis.started_at < threshold)
+            .filter(Synthesis.status.in_(("pending", "running")))
             .all()
         )
         now = datetime.now(timezone.utc)
@@ -120,9 +122,10 @@ def _ensure_voice_clone_columns() -> None:
     不给已存在的表加列**。所以给 models.VoiceClone 加字段必须配一个显式的
     ALTER TABLE，否则老库（已经有 voice_clones 表的）永远拿不到新列。
 
-    项目没有 Alembic versions 目录（见 db.py 的 docstring），所以这里用
-    inspector 判断列是否存在，缺了才 ALTER。SQLite 的 ADD COLUMN 是
-    O(1) 元数据操作，不重写表。
+    启动器 bin/podcast-gui.sh 不跑 alembic，所以这条 ALTER 还要留着。
+    同一组列也写在迁移 d5f8a21c6e40（down_revision 86e2ab3c95ab）。
+    两条路都用 inspector 判断列是否存在，缺了才 ALTER。SQLite 的
+    ADD COLUMN 是 O(1) 元数据操作，不重写表。
     """
     from sqlalchemy import inspect, text
     from gui.web.db import engine
@@ -158,7 +161,8 @@ def _backfill_minimax_voice_ids() -> None:
     先查 JSON），但界面会把它们全标成"未克隆"，误导用户去重复克隆消耗配额。
 
     只填空值，且只在 JSON 里确实有映射时才填。JSON 里没有的保持 NULL ——
-    那表示"确实还没克隆过"。
+    那表示"确实还没克隆过"。查音色时数据库优先，这份回填让老音色的
+    服务端 ID 跟网页上的修改走同一条路。
     """
     import json as _json
     from gui.web.db import SessionLocal
@@ -202,7 +206,7 @@ def _backfill_minimax_voice_ids() -> None:
 
 app = FastAPI(
     title="Podcast Generator",
-    version="0.4.4-web",
+    version=VERSION,
     description="本地播客生成工具 — Web 看板版（替代 PySide6）",
 )
 
@@ -216,6 +220,9 @@ app.add_middleware(
     same_site="lax",
     https_only=False,  # localhost dev OK; flip to True behind reverse proxy
 )
+
+# 后加的中间件在最外层。本机检查要包住 SessionMiddleware、/api 和 /output。
+app.add_middleware(LocalOnlyMiddleware)
 
 # 静态资源（CSS / JS / 图片）
 app.mount(
@@ -245,7 +252,7 @@ async def on_startup():
     import asyncio
     ws_manager.set_loop(asyncio.get_running_loop())
 
-    # 启动时清理 orphan synthesis rows（被 kill mid-synthesis 留下的"running"残骸）
+    # 上一进程留下的 pending / running 全部标失败，然后再开工
     _reconcile_orphaned_syntheses()
 
     # 给已有的 voice_clones 表补 MiniMax 克隆列（create_all 不会给老表加列）
@@ -254,23 +261,9 @@ async def on_startup():
     # 把 JSON 时代记录的 minimax_voice_id 回填进 DB（列刚补上时全是空的）
     _backfill_minimax_voice_ids()
 
-    # 信号兜底：捕获 SIGTERM / SIGINT（uvicorn 转发的硬杀信号），写 log 留死机痕迹。
-    # 必须在 startup 注册；on_shutdown 才注册就晚了（uvicorn 已经在 graceful shutdown）。
-    import signal
-    import sys
-
-    def _on_signal(signum, _frame):
-        log_path = OUTPUT_DIR / "web_server.log"
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(f"server killed by signal {signum} at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
-        sys.exit(0)
-
-    try:
-        signal.signal(signal.SIGTERM, _on_signal)
-        signal.signal(signal.SIGINT, _on_signal)
-    except ValueError:
-        # 非主线程无法注册（理论上不会，BackgroundTasks 是 thread pool）
-        pass
+    # 孤儿行已经标失败之后再开工。队列是守护线程，进程退出它就停，
+    # 不在这里用 SIGINT/SIGTERM 调 sys.exit（那会跳过 uvicorn 的收尾）。
+    start_worker()
 
 
 @app.on_event("shutdown")
@@ -290,7 +283,7 @@ async def index():
 @app.get("/health")
 async def health():
     """健康检查 — 启动后 curl 127.0.0.1:8765/health 确认服务在跑。"""
-    return {"ok": True, "version": "0.4.4-web", "phase": 7}
+    return {"ok": True, "version": VERSION, "phase": 7}
 
 
 @app.get("/api/version")
@@ -298,7 +291,7 @@ async def api_version():
     """前端调一次确认连上了。"""
     return JSONResponse(
         {
-            "version": "0.4.4-web",
+            "version": VERSION,
             "phase": 7,
             "features": {
                 "parse": True,              # Phase 2 ✅
@@ -314,7 +307,7 @@ async def api_version():
 
 
 # ============================================================
-# /api/credentials — 凭证状态（仅显示前缀，不返明文）
+# /api/credentials — 凭证是否配了（不返回密钥、前缀或长度）
 # ============================================================
 @app.get("/api/credentials")
 async def api_credentials():
@@ -325,8 +318,6 @@ async def api_credentials():
         "minimax": {
             "present": bool(mmx),
             "source": "config.json" if mmx else "",
-            "prefix": mmx[:7] + "..." if mmx else "",   # 演示用前缀
-            "length": len(mmx),
         },
         "volcengine": {
             "appid_present": bool(ve["appid"]),
@@ -391,10 +382,7 @@ async def api_parse(req: ParseRequest):
 # /api/synthesize/voxcpm — 本地 VoxCPM2 合成
 # ============================================================
 @app.post("/api/synthesize/voxcpm")
-async def api_synthesize_voxcpm(
-    req: SynthesizeRequest,
-    background: BackgroundTasks,
-):
+async def api_synthesize_voxcpm(req: SynthesizeRequest):
     """
     异步合成：返回后合成在后台跑，进度/日志通过 WebSocket /ws 推。
 
@@ -416,19 +404,24 @@ async def api_synthesize_voxcpm(
 
     output_path = build_output_path()
     task_id = Path(output_path).stem
-
-    background.add_task(
+    synth = _create_synthesis(
+        req.segments, req.voice_map, req.speed_map, "voxcpm", status="pending",
+    )
+    ahead = enqueue(
         synthesize_voxcpm_thread,
         req.segments,
         req.voice_map,
         req.speed_map,
         output_path,
+        synth.id if synth is not None else None,
+        task_id=task_id,
     )
 
     return SynthesizeStartResponse(
-        status="started",
+        status="queued",
         task_id=task_id,
         output=output_path,
+        ahead=ahead,
     )
 
 
@@ -436,10 +429,7 @@ async def api_synthesize_voxcpm(
 # /api/synthesize/minimax — MiniMax 云端 TTS
 # ============================================================
 @app.post("/api/synthesize/minimax")
-async def api_synthesize_minimax(
-    req: SynthesizeMiniMaxRequest,
-    background: BackgroundTasks,
-):
+async def api_synthesize_minimax(req: SynthesizeMiniMaxRequest):
     """
     MiniMax 异步合成。需要 api_key（从左侧凭证栏传）。
     voice_map 至少 2 个 voice（MiniMax 限制 2 个发音人）；超出回退到第一个。
@@ -460,8 +450,10 @@ async def api_synthesize_minimax(
 
     output_path = build_minimax_output_path()
     task_id = Path(output_path).stem
-
-    background.add_task(
+    synth = _create_synthesis(
+        req.segments, req.voice_map, req.speed_map, "minimax", status="pending",
+    )
+    ahead = enqueue(
         synthesize_minimax_thread,
         req.segments,
         req.voice_map,
@@ -469,12 +461,15 @@ async def api_synthesize_minimax(
         req.api_key,
         req.model,
         output_path,
+        synth.id if synth is not None else None,
+        task_id=task_id,
     )
 
     return SynthesizeStartResponse(
-        status="started",
+        status="queued",
         task_id=task_id,
         output=output_path,
+        ahead=ahead,
     )
 
 
@@ -482,10 +477,7 @@ async def api_synthesize_minimax(
 # /api/synthesize/doubao — 豆包（字节火山引擎）
 # ============================================================
 @app.post("/api/synthesize/doubao")
-async def api_synthesize_doubao(
-    req: SynthesizeDoubaoRequest,
-    background: BackgroundTasks,
-):
+async def api_synthesize_doubao(req: SynthesizeDoubaoRequest):
     """
     豆包异步合成。需要 appid + token；speakers 是火山引擎发音人 ID 列表。
     注：豆包不像 VoxCPM/MiniMax 有 per-segment progress，
@@ -506,20 +498,24 @@ async def api_synthesize_doubao(
 
     output_path = build_doubao_output_path()
     task_id = Path(output_path).stem
-
-    background.add_task(
+    voice_map = {f"speaker_{i}": spk for i, spk in enumerate(req.speakers or [])}
+    synth = _create_synthesis(req.segments, voice_map, {}, "doubao", status="pending")
+    ahead = enqueue(
         synthesize_doubao_thread,
         req.segments,
         req.speakers,
         req.appid,
         req.token,
         output_path,
+        synth.id if synth is not None else None,
+        task_id=task_id,
     )
 
     return SynthesizeStartResponse(
-        status="started",
+        status="queued",
         task_id=task_id,
         output=output_path,
+        ahead=ahead,
     )
 
 
@@ -583,12 +579,15 @@ async def api_add_voice(
 # /api/script/* — Phase 6 脚本生成入口
 # ============================================================
 @app.post("/api/script/generate")
-async def api_script_generate(
-    req: ScriptGenRequest,
-    background: BackgroundTasks,
-):
-    """Phase 6+: 引擎分发（minimax M3 / 豆包 PodcastTTS）。WebSocket 推 log + progress + script_done。"""
-    background.add_task(
+async def api_script_generate(req: ScriptGenRequest):
+    """Phase 6+: 引擎分发（minimax M3 / 豆包 PodcastTTS）。WebSocket 推 log + progress + script_done。
+
+    和合成走同一条队列，避免两边的日志插在一起。
+    """
+    import uuid
+
+    task_id = "script_" + uuid.uuid4().hex[:12]
+    ahead = enqueue(
         generate_script_thread,
         req.topic,
         req.context,
@@ -599,8 +598,9 @@ async def api_script_generate(
         req.engine,
         req.appid,
         req.token,
+        task_id=task_id,
     )
-    return {"status": "started", "topic": req.topic}
+    return {"status": "queued", "topic": req.topic, "task_id": task_id, "ahead": ahead}
 
 
 @app.get("/api/scripts/recent")

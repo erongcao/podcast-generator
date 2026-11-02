@@ -3,7 +3,7 @@ ws.py — WebSocket 连接管理器
 
 设计：
     - 浏览器连 `/ws` → 服务端 accept → 加入 clients
-    - 合成跑在 FastAPI BackgroundTasks（线程池）里
+    - 合成跑在进程内单线程队列（gui.web.jobs）里
     - 合成线程的 on_log / on_progress 回调 → ws_manager.push(...)
     - push 通过 asyncio.run_coroutine_threadsafe 把消息投回主事件循环 → 广播给所有 client
 
@@ -60,7 +60,15 @@ class WSManager:
         if not self.clients or not self.loop:
             return
         try:
-            asyncio.run_coroutine_threadsafe(self._send_all(message), self.loop)
+            # 工作线程里 jobs.current_task_id 有值时，给消息打上 task_id。
+            # 前端据此丢掉别的任务的 log / progress / done / error。
+            from gui.web.jobs import current_task_id
+
+            outgoing = dict(message)
+            task_id = current_task_id.get()
+            if task_id and "task_id" not in outgoing:
+                outgoing["task_id"] = task_id
+            asyncio.run_coroutine_threadsafe(self._send_all(outgoing), self.loop)
         except Exception as e:
             log.warning(f"WSManager: push 失败: {e}")
 

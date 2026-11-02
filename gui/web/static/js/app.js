@@ -9,6 +9,9 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
+  // 当前这条 WebSocket 要显示的任务。合成和脚本生成都会改它。
+  let currentTaskId = null;
+
   const log = (msg, level = 'info') => {
     const box = $('#log-box');
     if (!box) return;
@@ -40,7 +43,7 @@
       log(`❌ 后端连接失败: ${e.message}`, 'error');
       setStatus('❌ 后端无响应', 'err');
     }
-    // 拉凭证状态：显示 "已从 config.json 加载 sk-api-..."
+    // 拉凭证状态：只显示有没有，不显示密钥前缀
     try {
       const r = await fetch('/api/credentials');
       const c = await r.json();
@@ -49,8 +52,8 @@
       const ve = c.volcengine;
       const status = $('#cred-status');
       if (mmx.present) {
-        status.innerHTML = `<span style="color:var(--color-forest);">✅ MiniMax key 已从 ${mmx.source} 加载 (${mmx.prefix}) — 留空即可</span>`;
-        $('#cred-api-key').placeholder = `已加载 ${mmx.prefix} — 留空用默认`;
+        status.innerHTML = `<span style="color:var(--color-forest);">✅ MiniMax key 已从 ${mmx.source} 加载 — 留空即可</span>`;
+        $('#cred-api-key').placeholder = '已加载 — 留空用默认';
       } else {
         status.innerHTML = `<span style="color:var(--color-clay);">⚠ MiniMax key 未配置 — 在此填，或写到 config.json</span>`;
       }
@@ -458,7 +461,7 @@
       // minimax
       if (mmx?.present) {
         hint.innerHTML =
-          `<span style="color:var(--color-forest);">✅ MiniMax key 已就绪 (${mmx.prefix})</span>`;
+          `<span style="color:var(--color-forest);">✅ MiniMax key 已就绪</span>`;
       } else {
         hint.innerHTML =
           `<span style="color:var(--color-clay);">⚠ MiniMax key 未配置，生成会失败</span>`;
@@ -562,6 +565,14 @@
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (data.task_id) {
+        currentTaskId = data.task_id;
+        window._aiTaskId = data.task_id;
+      }
+      if (data.ahead > 0) {
+        log(`⏳ 前面还有 ${data.ahead} 个任务，排到再开始`, 'info');
       }
       const waitMsg = engine === 'doubao'
         ? '⏳ 已提交，后台跑豆包 WebSocket…最长 2 分钟'
@@ -760,7 +771,24 @@
     };
   }
 
+  function taskMismatch(msg) {
+    return !!(msg.task_id && currentTaskId && msg.task_id !== currentTaskId);
+  }
+
   function handleWSMessage(msg) {
+    // script_done 始终收下：当时的 currentTaskId 可能已经是另一个合成任务。
+    if (msg.type === 'script_done') {
+      onScriptDone(msg);
+      return;
+    }
+    // 脚本失败要复位「生成脚本」按钮，即使眼前正在看别的任务。
+    if (msg.type === 'error' && window._aiTaskId && msg.task_id === window._aiTaskId) {
+      onScriptGenError(msg);
+      return;
+    }
+    if (['log', 'progress', 'done', 'error'].includes(msg.type) && taskMismatch(msg)) {
+      return;
+    }
     switch (msg.type) {
       case 'hello':
         // 已经在 onopen log 过了，不重复
@@ -976,7 +1004,11 @@
         throw new Error(err.detail || `HTTP ${res.status}`);
       }
       const data = await res.json();
-      log(`📋 任务已启动: ${data.task_id} → ${data.output}`, 'info');
+      if (data.task_id) currentTaskId = data.task_id;
+      if (data.ahead > 0) {
+        log(`⏳ 前面还有 ${data.ahead} 个任务，排到再开始`, 'info');
+      }
+      log(`📋 任务已排队: ${data.task_id} → ${data.output}`, 'info');
     } catch (e) {
       log(`❌ 启动合成失败: ${e.message}`, 'error');
       setStatus('❌ 启动失败', 'err');
