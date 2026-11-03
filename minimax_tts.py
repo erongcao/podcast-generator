@@ -177,12 +177,15 @@ def synthesize(
             else:
                 raise
 
-    # Fallback 到 API
-    return _synthesize_api(
+    # Fallback 到 API。_synthesize_api 还给调用方留了响应体（字幕要用），
+    # 这里的契约是只返回音频字节。直接把元组交出去，写文件会报
+    # TypeError: a bytes-like object is required, not 'tuple'。
+    audio_bytes, _response = _synthesize_api(
         text=text, voice_id=voice_id, api_key=api_key, model=model,
         speed=speed, vol=vol, pitch=pitch, sample_rate=sample_rate,
         output_format=output_format, language_boost=language_boost,
     )
+    return audio_bytes
 
 
 def _synthesize_cli(
